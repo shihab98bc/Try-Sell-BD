@@ -1,0 +1,5 @@
+python-telegram-bot==20.3
+pyotp==2.8.0
+python-dotenv==1.0.0
+requests==2.31.0
+Faker==18.11.2
