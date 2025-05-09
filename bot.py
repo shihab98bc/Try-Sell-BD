@@ -1,3 +1,10 @@
+try:
+    import telebot
+except ImportError:
+    import os
+    os.system('pip install python-telegram-bot')
+    import telebot
+
 import os
 import time
 import re
