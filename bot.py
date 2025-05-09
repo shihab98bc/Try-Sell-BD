@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import pyotp
-
+import logging
 load_dotenv()
 
 # Initialize Faker
