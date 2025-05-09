@@ -1028,8 +1028,8 @@ def handle_my_account(m):
     safe_send_message(chat_id, msg)
 
 # --- Run bot & start threads ---
-print("🤖 Bot is running...")
-threading.Thread(target=auto_refresh_worker, daemon=True).start()
-threading.Thread(target=cleanup_blocked_users, daemon=True).start()
-
-bot.infinity_polling()
+if __name__ == "__main__":
+    print("🤖 Bot is running...")
+    threading.Thread(target=auto_refresh_worker, daemon=True).start()
+    threading.Thread(target=cleanup_blocked_users, daemon=True).start()
+    bot.infinity_polling()
