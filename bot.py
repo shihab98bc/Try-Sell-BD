@@ -1,50 +1,48 @@
-try:
-    import telebot
-except ImportError:
-    import os
-    os.system('pip install python-telegram-bot')
-    import telebot
-
 import os
-import time
-import re
-import requests
 import threading
+import time
 import datetime
 import random
 import string
+import re
 from faker import Faker
 from dotenv import load_dotenv
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import requests
 import pyotp
 
-load_dotenv()
+# For Flask health check
+if os.environ.get('RAILWAY_ENVIRONMENT'):
+    from flask import Flask
 
-# Initialize Faker
-fake = Faker()
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Load environment variables
+load_dotenv()
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")  # e.g., '123456789'
+PORT = int(os.environ.get('PORT', 5000))
 
-if not BOT_TOKEN:
-    raise Exception("❌ BOT_TOKEN not set in .env")
-if not ADMIN_ID:
-    raise Exception("❌ ADMIN_ID not set in .env")
+if not BOT_TOKEN or not ADMIN_ID:
+    raise Exception("Please set BOT_TOKEN and ADMIN_ID in environment variables.")
 
+# Initialize bot
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# Data storage
-user_data = {}             # {chat_id: {"email":..., "password":..., "token":...}}
-last_message_ids = {}      # {chat_id: set(msg_ids)}
-user_2fa_secrets = {}      # {chat_id: {"platform":..., "secret":...}}
+# Data stores
+user_data = {}               # {chat_id: {"email":..., "password":..., "token":...}}
+last_message_ids = {}        # {chat_id: set(msg_ids)}
+user_2fa_secrets = {}        # {chat_id: {"platform":..., "secret":...}}
 active_sessions = set()
-pending_approvals = {}     # {chat_id: user_info}
-approved_users = set()     # set of chat_ids approved
-user_profiles = {}        # {chat_id: {"name":..., "username":..., "join_date":...}}
+pending_approvals = {}       # {chat_id: user_info}
+approved_users = set()
+user_profiles = {}           # {chat_id: {"name":..., "username":..., "join_date":...}}
 
-# --- Helper Functions ---
+fake = Faker()
+
+# Helper functions
 def is_admin(chat_id):
     return str(chat_id) == str(ADMIN_ID)
 
@@ -119,7 +117,7 @@ def safe_send_message(chat_id, text, **kwargs):
     try:
         if is_bot_blocked(chat_id):
             safe_delete_user(chat_id)
-            return
+            return None
         return bot.send_message(chat_id, text, **kwargs)
     except:
         safe_delete_user(chat_id)
@@ -191,14 +189,16 @@ def is_valid_base32(secret):
     except:
         return False
 
-# --- Workers ---
+# --- Worker threads ---
 def auto_refresh_worker():
     while True:
         for chat_id in list(user_data):
             if is_bot_blocked(chat_id) or (chat_id not in approved_users and not is_admin(chat_id)):
                 safe_delete_user(chat_id)
                 continue
-            token = user_data[chat_id]["token"]
+            token = user_data.get(chat_id, {}).get("token")
+            if not token:
+                continue
             headers = {"Authorization": f"Bearer {token}"}
             try:
                 res = requests.get("https://api.mail.tm/messages", headers=headers, timeout=10)
@@ -270,17 +270,18 @@ def handle_start_help(message):
     else:
         pending_approvals[chat_id] = user_info
         safe_send_message(chat_id, "👋 Your access request has been sent to admin. Please wait for approval.")
-        if ADMIN_ID:
-            approval_msg = (
-                f"🆕 *New Approval Request*\n\n"
-                f"🆔 User ID: `{chat_id}`\n"
-                f"👤 Name: `{user_info['name']}`\n"
-                f"📛 Username: @{user_info['username']}\n"
-                f"📅 Joined: `{user_info['join_date']}`"
-            )
-            bot.send_message(ADMIN_ID, approval_msg, reply_markup=get_approval_keyboard(chat_id))
+        # Notify admin
+        approval_msg = (
+            f"🆕 *New Approval Request*\n\n"
+            f"🆔 User ID: `{chat_id}`\n"
+            f"👤 Name: `{user_info['name']}`\n"
+            f"📛 Username: @{user_info['username']}\n"
+            f"📅 Joined: `{user_info['join_date']}`"
+        )
+        bot.send_message(ADMIN_ID, approval_msg, reply_markup=get_approval_keyboard(chat_id))
 
-# --- Main Menu Handling ---
+# --- Main Menu Handlers ---
+
 @bot.message_handler(func=lambda m: m.text == "👑 Admin Panel" and is_admin(m.chat.id))
 def handle_admin_panel(m):
     safe_send_message(m.chat.id, "👑 Admin Panel", reply_markup=get_admin_keyboard())
@@ -322,11 +323,17 @@ def handle_list_users(m):
     if not approved_users:
         safe_send_message(m.chat.id, "❌ No approved users.")
         return
-    full_details = []
+    details_list = []
     for uid in approved_users:
-        info = user_profiles.get(uid, {})
-        full_details.append(f"🆔 `{uid}`\n👤 {info.get('name','')}\n@{info.get('username','')}\nJoined: {info.get('join_date','')}\n")
-    msg = "👥 *Approved Users:*\n\n" + "\n".join(full_details)
+        profile = user_profiles.get(uid, {})
+        details = (
+            f"🆔 `{uid}`\n"
+            f"👤 {profile.get('name','')}\n"
+            f"@{profile.get('username','')}\n"
+            f"Joined: {profile.get('join_date','')}\n"
+        )
+        details_list.append(details)
+    msg = "👥 *Approved Users:*\n\n" + "\n".join(details_list)
     safe_send_message(m.chat.id, msg)
 
 @bot.message_handler(func=lambda m: m.text == "❌ Remove User" and is_admin(m.chat.id))
@@ -362,7 +369,7 @@ def handle_broadcast_menu(m):
     safe_send_message(m.chat.id, "📢 Broadcast Options", reply_markup=get_broadcast_keyboard())
 
 @bot.message_handler(func=lambda m: m.text == "📢 Text Broadcast" and is_admin(m.chat.id))
-def handle_text_broadcast_prompt(m):
+def handle_broadcast_prompt(m):
     safe_send_message(m.chat.id, "✍️ Enter message to broadcast:", reply_markup=get_back_keyboard())
     bot.register_next_step_handler(m, handle_process_text_broadcast)
 
@@ -442,7 +449,7 @@ def handle_back_to_admin(m):
 def handle_back_to_main(m):
     safe_send_message(m.chat.id, "⬅️ Returning to main menu...", reply_markup=get_main_keyboard(m.chat.id))
 
-# --- Callback Handlers ---
+# --- Callback query handler for approvals ---
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_', 'reject_')))
 def handle_approval_callback(c):
     if not is_admin(c.message.chat.id):
@@ -655,7 +662,7 @@ def generate_profile(gender):
     phone = '1' + ''.join([str(random.randint(200, 999))]) + ''.join([str(random.randint(0, 9)) for _ in range(7)])
     return gender, name, username, password, phone
 
-# --- Email Functions ---
+# --- Email functions ---
 def get_domain():
     try:
         res = requests.get("https://api.mail.tm/domains", timeout=10)
@@ -693,7 +700,7 @@ def get_token(email, password):
     except:
         return None
 
-# --- Main Handlers ---
+# --- Main handlers ---
 @bot.message_handler(commands=['start', 'help'])
 def handle_start_help(m):
     chat_id = m.chat.id
@@ -710,17 +717,17 @@ def handle_start_help(m):
     else:
         pending_approvals[chat_id] = user_info
         safe_send_message(chat_id, "👋 Your access request has been sent to admin. Please wait for approval.")
-        if ADMIN_ID:
-            approval_msg = (
-                f"🆕 *New Approval Request*\n\n"
-                f"🆔 User ID: `{chat_id}`\n"
-                f"👤 Name: `{user_info['name']}`\n"
-                f"📛 Username: @{user_info['username']}\n"
-                f"📅 Joined: `{user_info['join_date']}`"
-            )
-            bot.send_message(ADMIN_ID, approval_msg, reply_markup=get_approval_keyboard(chat_id))
+        # Notify admin
+        approval_msg = (
+            f"🆕 *New Approval Request*\n\n"
+            f"🆔 User ID: `{chat_id}`\n"
+            f"👤 Name: `{user_info['name']}`\n"
+            f"📛 Username: @{user_info['username']}\n"
+            f"📅 Joined: `{user_info['join_date']}`"
+        )
+        bot.send_message(ADMIN_ID, approval_msg, reply_markup=get_approval_keyboard(chat_id))
 
-# --- Main Menu Handlers ---
+# --- Main menu handlers ---
 @bot.message_handler(func=lambda m: m.text == "👑 Admin Panel" and is_admin(m.chat.id))
 def handle_admin_panel(m):
     safe_send_message(m.chat.id, "👑 Admin Panel", reply_markup=get_admin_keyboard())
@@ -762,7 +769,6 @@ def handle_list_users(m):
     if not approved_users:
         safe_send_message(m.chat.id, "❌ No approved users.")
         return
-    # Compose full details of each approved user
     details_list = []
     for uid in approved_users:
         profile = user_profiles.get(uid, {})
@@ -773,7 +779,7 @@ def handle_list_users(m):
             f"Joined: {profile.get('join_date','')}\n"
         )
         details_list.append(details)
-    msg = "👥 *Approved Users Details:*\n\n" + "\n".join(details_list)
+    msg = "👥 *Approved Users:*\n\n" + "\n".join(details_list)
     safe_send_message(m.chat.id, msg)
 
 @bot.message_handler(func=lambda m: m.text == "❌ Remove User" and is_admin(m.chat.id))
@@ -889,7 +895,7 @@ def handle_back_to_admin(m):
 def handle_back_to_main(m):
     safe_send_message(m.chat.id, "⬅️ Returning to main menu...", reply_markup=get_main_keyboard(m.chat.id))
 
-# --- Callback Query Handlers ---
+# --- Callback handlers ---
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_', 'reject_')))
 def handle_approval_callback(c):
     if not is_admin(c.message.chat.id):
@@ -912,7 +918,7 @@ def handle_approval_callback(c):
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
         safe_send_message(c.message.chat.id, f"❌ User {uid} rejected.")
 
-# --- Main Mail Functions ---
+# --- Main mail functions ---
 @bot.message_handler(func=lambda m: m.text == "📬 New mail")
 def handle_new_mail(m):
     chat_id = m.chat.id
@@ -995,7 +1001,7 @@ def handle_refresh(m):
         except:
             pass
 
-# --- Profile Handlers ---
+# --- Profile handlers ---
 @bot.message_handler(func=lambda m: m.text in ["👨 Male Profile", "👩 Female Profile"])
 def handle_generate_profile(m):
     chat_id = m.chat.id
@@ -1015,7 +1021,7 @@ def handle_generate_profile(m):
     msg = profile_message(gender, name, username, password, phone)
     safe_send_message(chat_id, msg)
 
-# --- Handle "👤 My Account" ---
+# --- "👤 My Account" ---
 @bot.message_handler(func=lambda m: m.text == "👤 My Account")
 def handle_my_account(m):
     chat_id = m.chat.id
@@ -1036,19 +1042,19 @@ def handle_my_account(m):
 
 # --- Run bot & start threads ---
 if __name__ == "__main__":
-    print("🤖 Bot is running...")
+    print("🤖 Bot is starting...")
+
+    # Start background workers
     threading.Thread(target=auto_refresh_worker, daemon=True).start()
     threading.Thread(target=cleanup_blocked_users, daemon=True).start()
-    
-    # For Railway deployment
-    if 'RAILWAY_ENVIRONMENT' in os.environ:
-        PORT = int(os.environ.get('PORT', 5000))
-        # Simple health check endpoint
-        from flask import Flask
+
+    # Flask health check for Railway
+    if os.environ.get('RAILWAY_ENVIRONMENT'):
         app = Flask(__name__)
         @app.route('/')
-        def health_check():
+        def health():
             return "Bot is running"
         threading.Thread(target=app.run, kwargs={'host':'0.0.0.0','port':PORT}).start()
-    
+
+    # Start polling
     bot.infinity_polling()
