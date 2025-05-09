@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import pyotp
-import logging
+
 load_dotenv()
 
 # Initialize Faker
@@ -1028,8 +1028,8 @@ def handle_my_account(m):
     safe_send_message(chat_id, msg)
 
 # --- Run bot & start threads ---
-if __name__ == "__main__":
-    print("🤖 Bot is running...")
-    threading.Thread(target=auto_refresh_worker, daemon=True).start()
-    threading.Thread(target=cleanup_blocked_users, daemon=True).start()
-    bot.infinity_polling()
+if 'RAILWAY_ENVIRONMENT' in os.environ:
+    PORT = int(os.environ.get('PORT', 5000))
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=f"https://{os.environ['RAILWAY_STATIC_URL']}")
