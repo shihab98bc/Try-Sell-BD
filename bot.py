@@ -1,4 +1,5 @@
 import os
+PORT = int(os.environ.get('PORT', 5000))
 import time
 import re
 import requests
@@ -1028,8 +1029,22 @@ def handle_my_account(m):
     safe_send_message(chat_id, msg)
 
 # --- Run bot & start threads ---
-if 'RAILWAY_ENVIRONMENT' in os.environ:
-    PORT = int(os.environ.get('PORT', 5000))
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=f"https://{os.environ['RAILWAY_STATIC_URL']}")
+if __name__ == "__main__":
+    print("🤖 Bot is running...")
+    threading.Thread(target=auto_refresh_worker, daemon=True).start()
+    threading.Thread(target=cleanup_blocked_users, daemon=True).start()
+    
+    # Different behavior for Railway vs local
+    if 'RAILWAY_ENVIRONMENT' in os.environ:
+        from flask import Flask
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def home():
+            return "Telegram bot is running"
+            
+        # Start Flask server in background
+        threading.Thread(target=app.run, kwargs={'host':'0.0.0.0','port':PORT}).start()
+    
+    # Start Telegram bot
+    bot.infinity_polling()
