@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import requests
 import pyotp
 
-# For Flask health check
+# For Flask health check on Railway
 if os.environ.get('RAILWAY_ENVIRONMENT'):
     from flask import Flask
 
@@ -28,17 +28,16 @@ PORT = int(os.environ.get('PORT', 5000))
 if not BOT_TOKEN or not ADMIN_ID:
     raise Exception("Please set BOT_TOKEN and ADMIN_ID in environment variables.")
 
-# Initialize bot
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 # Data stores
-user_data = {}               # {chat_id: {"email":..., "password":..., "token":...}}
-last_message_ids = {}        # {chat_id: set(msg_ids)}
-user_2fa_secrets = {}        # {chat_id: {"platform":..., "secret":...}}
+user_data = {}             # {chat_id: {"email":..., "password":..., "token":...}}
+last_message_ids = {}      # {chat_id: set(msg_ids)}
+user_2fa_secrets = {}      # {chat_id: {"platform":..., "secret":...}}
 active_sessions = set()
-pending_approvals = {}       # {chat_id: user_info}
+pending_approvals = {}     # {chat_id: user_info}
 approved_users = set()
-user_profiles = {}           # {chat_id: {"name":..., "username":..., "join_date":...}}
+user_profiles = {}         # {chat_id: {"name":..., "username":..., "join_date":...}}
 
 fake = Faker()
 
@@ -66,6 +65,7 @@ def is_bot_blocked(chat_id):
         return True
 
 def get_user_info(user):
+    # Basic info
     return {
         "name": user.first_name + (f" {user.last_name}" if user.last_name else ""),
         "username": user.username if user.username else "N/A",
@@ -255,13 +255,15 @@ def cleanup_blocked_users():
 # --- Handlers ---
 
 @bot.message_handler(commands=['start', 'help'])
-def handle_start_help(message):
-    chat_id = message.chat.id
+def handle_start_help(m):
+    chat_id = m.chat.id
     if is_bot_blocked(chat_id):
         safe_delete_user(chat_id)
         return
-    user_info = get_user_info(message.from_user)
+    user_info = get_user_info(m.from_user)
     user_profiles[chat_id] = user_info
+    # Save join date
+    user_profiles[chat_id]["join_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if is_admin(chat_id):
         approved_users.add(chat_id)
         safe_send_message(chat_id, "👋 Welcome Admin!", reply_markup=get_main_keyboard(chat_id))
@@ -449,7 +451,7 @@ def handle_back_to_admin(m):
 def handle_back_to_main(m):
     safe_send_message(m.chat.id, "⬅️ Returning to main menu...", reply_markup=get_main_keyboard(m.chat.id))
 
-# --- Callback query handler for approvals ---
+# --- Callback query handlers for approvals ---
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_', 'reject_')))
 def handle_approval_callback(c):
     if not is_admin(c.message.chat.id):
@@ -472,7 +474,7 @@ def handle_approval_callback(c):
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
         safe_send_message(c.message.chat.id, f"❌ User {uid} rejected.")
 
-# --- Main Mail Functions ---
+# --- Main mail functions ---
 @bot.message_handler(func=lambda m: m.text == "📬 New mail")
 def handle_new_mail(m):
     chat_id = m.chat.id
@@ -579,22 +581,22 @@ def handle_generate_profile(m):
 @bot.message_handler(func=lambda m: m.text == "👤 My Account")
 def handle_my_account(m):
     chat_id = m.chat.id
-    if not is_authorized(chat_id):
-        safe_send_message(chat_id, "⏳ Your access is pending approval.")
-        return
-    profile = user_profiles.get(chat_id)
-    if not profile:
-        safe_send_message(chat_id, "No profile info available.")
-        return
+    user = m.from_user
+    # Get real Telegram info
+    name = user.first_name
+    if user.last_name:
+        name += f" {user.last_name}"
+    username = f"@{user.username}" if user.username else "N/A"
+    join_date = user_profiles.get(chat_id, {}).get("join_date", "N/A")
     msg = (
-        f"🧑‍💼 *Your Account Info*\n\n"
-        f"👤 Name: {profile.get('name')}\n"
-        f"🆔 Username: {profile.get('username')}\n"
-        f"📅 Joined: {profile.get('join_date')}"
+        f"🧑‍💼 *Your Telegram Profile Info*\n\n"
+        f"👤 Name: {name}\n"
+        f"🆔 Username: {username}\n"
+        f"📅 Joined: {join_date}\n"
     )
     safe_send_message(chat_id, msg)
 
-# --- 2FA Handler ---
+# --- "🔐 2FA Auth" ---
 @bot.message_handler(func=lambda m: m.text == "🔐 2FA Auth")
 def handle_2fa_main(m):
     chat_id = m.chat.id
@@ -709,6 +711,8 @@ def handle_start_help(m):
         return
     user_info = get_user_info(m.from_user)
     user_profiles[chat_id] = user_info
+    # Save join date
+    user_profiles[chat_id]["join_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if is_admin(chat_id):
         approved_users.add(chat_id)
         safe_send_message(chat_id, "👋 Welcome Admin!", reply_markup=get_main_keyboard(chat_id))
@@ -717,7 +721,6 @@ def handle_start_help(m):
     else:
         pending_approvals[chat_id] = user_info
         safe_send_message(chat_id, "👋 Your access request has been sent to admin. Please wait for approval.")
-        # Notify admin
         approval_msg = (
             f"🆕 *New Approval Request*\n\n"
             f"🆔 User ID: `{chat_id}`\n"
@@ -1025,18 +1028,18 @@ def handle_generate_profile(m):
 @bot.message_handler(func=lambda m: m.text == "👤 My Account")
 def handle_my_account(m):
     chat_id = m.chat.id
-    if not is_authorized(chat_id):
-        safe_send_message(chat_id, "⏳ Your access is pending approval.")
-        return
-    profile = user_profiles.get(chat_id)
-    if not profile:
-        safe_send_message(chat_id, "No profile info available.")
-        return
+    user = m.from_user
+    # Get real Telegram info
+    name = user.first_name
+    if user.last_name:
+        name += f" {user.last_name}"
+    username = f"@{user.username}" if user.username else "N/A"
+    join_date = user_profiles.get(chat_id, {}).get("join_date", "N/A")
     msg = (
-        f"🧑‍💼 *Your Account Info*\n\n"
-        f"👤 Name: {profile.get('name')}\n"
-        f"🆔 Username: {profile.get('username')}\n"
-        f"📅 Joined: {profile.get('join_date')}"
+        f"🧑‍💼 *Your Telegram Profile Info*\n\n"
+        f"👤 Name: {name}\n"
+        f"🆔 Username: {username}\n"
+        f"📅 Joined: {join_date}\n"
     )
     safe_send_message(chat_id, msg)
 
