@@ -1,5 +1,4 @@
 import os
-PORT = int(os.environ.get('PORT', 5000))
 import time
 import re
 import requests
@@ -1034,17 +1033,15 @@ if __name__ == "__main__":
     threading.Thread(target=auto_refresh_worker, daemon=True).start()
     threading.Thread(target=cleanup_blocked_users, daemon=True).start()
     
-    # Different behavior for Railway vs local
+    # For Railway deployment
     if 'RAILWAY_ENVIRONMENT' in os.environ:
+        PORT = int(os.environ.get('PORT', 5000))
+        # Simple health check endpoint
         from flask import Flask
         app = Flask(__name__)
-        
         @app.route('/')
-        def home():
-            return "Telegram bot is running"
-            
-        # Start Flask server in background
+        def health_check():
+            return "Bot is running"
         threading.Thread(target=app.run, kwargs={'host':'0.0.0.0','port':PORT}).start()
     
-    # Start Telegram bot
     bot.infinity_polling()
