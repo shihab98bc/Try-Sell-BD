@@ -24,15 +24,14 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# --- API Configuration and Retry Settings ---
-TEMP_MAIL_API_BASE_URL = "https://api.temp-mail.org/request"
-DEFAULT_TEMP_MAIL_DOMAIN = "kumailone.com" # Changed fallback domain, porjoton.com sometimes has issues
+# --- API Configuration for 1secmail.com and Retry Settings ---
+ONECMAIL_API_BASE_URL = "https://www.1secmail.com/api/v1/"
 MAX_RETRIES = 3
-RETRY_DELAY = 3  # seconds, will be multiplied by attempt number for backoff
+RETRY_DELAY = 3  # seconds, base delay for retries
 
 # Data storage
-user_data = {}
-last_message_ids = {}
+user_data = {} # Stores {"email": "login@domain.com", "login": "login", "domain": "domain"}
+last_message_ids = {} # Stores set of integer message IDs from 1secmail
 active_sessions = set()
 pending_approvals = {}
 approved_users = set()
@@ -45,10 +44,9 @@ def is_admin(chat_id):
     return str(chat_id) == ADMIN_ID
 
 def safe_delete_user(chat_id):
-    # Use pop with default to avoid KeyErrors if chat_id not in a dict
     user_data.pop(chat_id, None)
     last_message_ids.pop(chat_id, None)
-    user_2fa_secrets.pop(chat_id, None) # Clears all 2FA secrets for the user
+    user_2fa_secrets.pop(chat_id, None)
     active_sessions.discard(chat_id)
     pending_approvals.pop(chat_id, None)
     approved_users.discard(chat_id)
@@ -165,103 +163,88 @@ def safe_send_message(chat_id, text, **kwargs):
         print(f"Generic error sending message to {chat_id}: {str(e)}")
         return None
 
-# --- Temp Mail Functions with Retry ---
-def get_temp_mail_domains():
+# --- 1secmail.com API Functions with Retry ---
+
+def generate_1secmail_address():
+    """Generates a random email address from 1secmail.com."""
+    params = {'action': 'genRandomMailbox', 'count': 1}
     for attempt in range(MAX_RETRIES):
         try:
-            # print(f"DEBUG: Attempt {attempt+1} to fetch domains...")
-            res = requests.get(f"{TEMP_MAIL_API_BASE_URL}/domains/format/json/", timeout=10)
+            res = requests.get(ONECMAIL_API_BASE_URL, params=params, timeout=10)
             res.raise_for_status()
-            domains_from_api = res.json()
-            valid_domains = [d.lstrip('.') for d in domains_from_api if isinstance(d, str) and d.strip() and d.startswith('.')]
-            if valid_domains:
-                return valid_domains
-            # print(f"DEBUG: No valid domains starting with '.' found, using fallback. API response: {domains_from_api}")
-            return [DEFAULT_TEMP_MAIL_DOMAIN] # Fallback if API returns empty or malformed list
+            data = res.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                email_full = data[0]
+                if '@' in email_full:
+                    login, domain = email_full.split('@', 1)
+                    return "SUCCESS", {"email": email_full, "login": login, "domain": domain}
+            return "API_ERROR", "Invalid response from email generation service."
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1:
-                # print(f"DEBUG: Network error fetching domains (attempt {attempt+1}): {e}. Retrying in {RETRY_DELAY * (attempt + 1)}s...")
                 time.sleep(RETRY_DELAY * (attempt + 1))
             else:
-                print(f"Error fetching temp-mail domains (network) after {MAX_RETRIES} attempts: {e}")
-                return [DEFAULT_TEMP_MAIL_DOMAIN]
+                return "NETWORK_ERROR", f"Network error generating email after {MAX_RETRIES} attempts."
         except ValueError:
-            print(f"Error decoding temp-mail domains JSON. Using fallback.")
-            return [DEFAULT_TEMP_MAIL_DOMAIN]
+            return "JSON_ERROR", "Invalid JSON response from email generation service."
         except Exception as e:
-            print(f"Unexpected error fetching temp-mail domains: {e}. Using fallback.")
-            return [DEFAULT_TEMP_MAIL_DOMAIN]
-    return [DEFAULT_TEMP_MAIL_DOMAIN] # Should be unreachable if loop completes
+            return "API_ERROR", f"Unexpected error generating email: {str(e)}"
+    return "API_ERROR", "Failed to generate email after multiple attempts."
 
-def generate_temp_mail_address():
-    try:
-        name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-        domains = get_temp_mail_domains()
-        domain = random.choice(domains) if domains else DEFAULT_TEMP_MAIL_DOMAIN
-        return f"{name}@{domain}"
-    except Exception as e:
-        print(f"Error generating temp mail address: {e}")
-        name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-        return f"{name}@{DEFAULT_TEMP_MAIL_DOMAIN}"
 
-def fetch_temp_mail_messages(email_address):
-    if not email_address:
-        return "API_ERROR", "Email address not provided"
-    
-    request_url = "" 
-    email_hash = hashlib.md5(email_address.encode('utf-8')).hexdigest()
-    request_url = f"{TEMP_MAIL_API_BASE_URL}/mail/id/{email_hash}/format/json/"
-
+def get_1secmail_message_list(login, domain):
+    """Fetches message list (summaries) for a 1secmail address."""
+    params = {'action': 'getMessages', 'login': login, 'domain': domain}
     for attempt in range(MAX_RETRIES):
         try:
-            # print(f"DEBUG: Attempt {attempt+1} to fetch messages for {email_address} from {request_url}")
-            res = requests.get(request_url, timeout=15) # Timeout for connect and read
-            # print(f"DEBUG: API Response Status Code: {res.status_code} for {email_address}")
-            # if res.status_code != 200 : print(f"DEBUG: API Response Text: {res.text[:200]} for {email_address}")
-
-            res.raise_for_status() 
-            
+            res = requests.get(ONECMAIL_API_BASE_URL, params=params, timeout=15)
+            res.raise_for_status()
             messages = res.json()
-            
-            if isinstance(messages, dict) and "error" in messages:
-                # print(f"DEBUG: API returned error: {messages['error']} for {email_address}")
-                if messages['error'] == 'no_mail':
-                    return "EMPTY", [] 
-                return "API_ERROR", f"Service error: {messages['error']}"
-            
             if isinstance(messages, list):
                 return "EMPTY" if not messages else "SUCCESS", messages
-            else:
-                # print(f"DEBUG: Unexpected API response type: {type(messages)} for {email_address}")
-                return "API_ERROR", "Unexpected response format from email service."
-
+            return "API_ERROR", "Unexpected response format for message list."
         except requests.exceptions.HTTPError as e:
             if e.response.status_code in [500, 502, 503, 504] and attempt < MAX_RETRIES - 1:
-                # print(f"DEBUG: HTTP error {e.response.status_code} for {email_address}. Retrying ({attempt+1}/{MAX_RETRIES})...")
                 time.sleep(RETRY_DELAY * (attempt + 1))
                 continue
-            else:
-                err_msg = f"Email service failed (HTTP {e.response.status_code})"
-                if e.response.status_code == 404:
-                    err_msg = f"Email service endpoint not found (404)"
-                # print(f"DEBUG: Final HTTP error for {email_address}: {err_msg}")
-                return "API_ERROR", err_msg
-        except requests.exceptions.RequestException as e: # Covers ConnectionError, Timeout, etc.
+            return "API_ERROR", f"Email service failed (HTTP {e.response.status_code}) for message list."
+        except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1:
-                # print(f"DEBUG: Network error for {email_address}. Retrying ({attempt+1}/{MAX_RETRIES}): {e}")
                 time.sleep(RETRY_DELAY * (attempt + 1))
                 continue
-            else:
-                # print(f"DEBUG: Max retries reached for network error fetching for {email_address}: {e}")
-                return "NETWORK_ERROR", f"Network error connecting to email service after {MAX_RETRIES} attempts."
+            return "NETWORK_ERROR", f"Network error fetching message list after {MAX_RETRIES} attempts."
         except ValueError:
-            # print(f"DEBUG: JSON decoding error for {email_address}.")
-            return "JSON_ERROR", f"Invalid response format from email service."
+            return "JSON_ERROR", "Invalid JSON response for message list."
         except Exception as e:
-            # print(f"DEBUG: Unexpected error in fetch_temp_mail_messages for {email_address}: {e}")
-            return "API_ERROR", f"An unexpected error occurred with the email service."
-    
-    return "API_ERROR", "Failed to fetch emails after multiple attempts due to an unknown issue."
+            return "API_ERROR", f"Unexpected error fetching message list: {str(e)}"
+    return "API_ERROR", "Failed to fetch message list after multiple attempts."
+
+
+def read_1secmail_message_detail(login, domain, message_id):
+    """Reads a specific message detail from 1secmail."""
+    params = {'action': 'readMessage', 'login': login, 'domain': domain, 'id': message_id}
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.get(ONECMAIL_API_BASE_URL, params=params, timeout=15)
+            res.raise_for_status()
+            message_detail = res.json()
+            if isinstance(message_detail, dict) and 'id' in message_detail:
+                return "SUCCESS", message_detail
+            return "API_ERROR", "Unexpected response format for message detail."
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [500, 502, 503, 504] and attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            return "API_ERROR", f"Email service failed (HTTP {e.response.status_code}) for message detail."
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            return "NETWORK_ERROR", f"Network error fetching message detail after {MAX_RETRIES} attempts."
+        except ValueError:
+            return "JSON_ERROR", "Invalid JSON response for message detail."
+        except Exception as e:
+            return "API_ERROR", f"Unexpected error fetching message detail: {str(e)}"
+    return "API_ERROR", "Failed to fetch message detail after multiple attempts."
 
 
 # --- Profile Generator ---
@@ -310,38 +293,26 @@ def is_valid_base32(secret):
         return False
 
 # --- Background Workers & Email Formatting ---
-def format_temp_mail_message(msg_detail):
-    sender = msg_detail.get('mail_from', 'N/A')
-    subject = msg_detail.get('mail_subject', '(No Subject)')
+def format_1secmail_message(msg_detail):
+    sender = msg_detail.get('from', 'N/A')
+    subject = msg_detail.get('subject', '(No Subject)')
     
-    body_content = msg_detail.get('mail_text', '')
-    if not body_content and 'mail_html' in msg_detail:
-        html_body = msg_detail['mail_html']
-        try: 
-            body_content = requests.utils.unquote(html_body) 
-        except Exception:
-            body_content = html_body
-        
-        body_content = re.sub(r'<style[^>]*?>.*?</style>', '', body_content, flags=re.DOTALL | re.IGNORECASE)
+    # Prefer textBody, fallback to body (HTML), then to default
+    body_content = msg_detail.get('textBody', '')
+    if not body_content and 'body' in msg_detail: # 'body' is HTML for 1secmail
+        html_body = msg_detail['body']
+        # Basic HTML stripping
+        body_content = re.sub(r'<style[^>]*?>.*?</style>', '', html_body, flags=re.DOTALL | re.IGNORECASE)
         body_content = re.sub(r'<script[^>]*?>.*?</script>', '', body_content, flags=re.DOTALL | re.IGNORECASE)
         body_content = re.sub(r'<br\s*/?>', '\n', body_content, flags=re.IGNORECASE)
         body_content = re.sub(r'</p>', '\n</p>', body_content, flags=re.IGNORECASE) 
-        body_content = re.sub(r'<[^>]+>', '', body_content)
+        body_content = re.sub(r'<[^>]+>', '', body_content) # Strip all other tags
         body_content = body_content.replace('&nbsp;', ' ').replace('&amp;', '&')
         body_content = body_content.replace('&lt;', '<').replace('&gt;', '>')
         body_content = '\n'.join([line.strip() for line in body_content.splitlines() if line.strip()])
 
     body_content = body_content.strip() if body_content else "(No Content)"
-
-    received_time_str = "Just now"
-    timestamp = msg_detail.get('mail_timestamp')
-    if timestamp:
-        try:
-            received_time_str = datetime.datetime.fromtimestamp(int(timestamp)).strftime('%Y-%m-%d %H:%M:%S UTC')
-        except (ValueError, TypeError):
-            received_time_str = str(timestamp) 
-    elif 'mail_date' in msg_detail:
-        received_time_str = msg_detail['mail_date']
+    received_time_str = msg_detail.get('date', 'Just now') # 1secmail provides formatted date
 
     return (
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -365,44 +336,57 @@ def auto_refresh_worker():
                 if is_bot_blocked(chat_id) or (chat_id not in approved_users and not is_admin(chat_id)):
                     safe_delete_user(chat_id)
                     continue
-                if "email" not in user_data.get(chat_id, {}): continue
-
-                email_address = user_data[chat_id]["email"]
-                status, mail_api_data = fetch_temp_mail_messages(email_address)
                 
-                if status not in ["SUCCESS", "EMPTY"]:
-                    print(f"Auto-refresh: Error for {chat_id} ({email_address}): {status} - {mail_api_data}")
+                current_email_info = user_data.get(chat_id)
+                if not current_email_info or "login" not in current_email_info or "domain" not in current_email_info:
+                    continue
+
+                login = current_email_info["login"]
+                domain = current_email_info["domain"]
+                
+                list_status, message_summaries = get_1secmail_message_list(login, domain)
+                
+                if list_status not in ["SUCCESS", "EMPTY"]:
+                    print(f"Auto-refresh: Error fetching list for {login}@{domain}: {list_status} - {message_summaries}")
                     continue 
-                if status == "EMPTY" or not mail_api_data: continue
+                if list_status == "EMPTY" or not message_summaries:
+                    continue
 
-                messages = mail_api_data
                 seen_ids = last_message_ids.setdefault(chat_id, set())
+                
+                # Sort by date if possible, 1secmail date is string like "2021-09-01 10:00:00"
                 try:
-                    messages.sort(key=lambda m: int(m.get('mail_timestamp', 0)), reverse=True)
-                except (TypeError, ValueError): pass 
+                    message_summaries.sort(key=lambda m: m.get('date', "0000-00-00 00:00:00"), reverse=True)
+                except Exception: pass 
 
-                for msg_detail in messages[:5]: 
-                    msg_id = msg_detail.get('mail_id') 
-                    if not msg_id: 
-                        msg_id = hashlib.md5((str(msg_detail.get('mail_from','')) + \
-                                             str(msg_detail.get('mail_subject','')) + \
-                                             str(msg_detail.get('mail_timestamp',''))).encode()).hexdigest()
-                    if msg_id in seen_ids: continue
+                for msg_summary in message_summaries[:5]: # Check top 5 recent from summary
+                    msg_id = msg_summary.get('id') 
+                    if not isinstance(msg_id, int): continue # ID should be an integer
+
+                    if msg_id in seen_ids:
+                        continue
                     
-                    seen_ids.add(msg_id)
-                    formatted_msg = format_temp_mail_message(msg_detail)
-                    safe_send_message(chat_id, formatted_msg)
-                    time.sleep(0.5) 
+                    # Fetch full message detail
+                    detail_status, msg_detail_data = read_1secmail_message_detail(login, domain, msg_id)
+                    if detail_status == "SUCCESS":
+                        formatted_msg = format_1secmail_message(msg_detail_data)
+                        if safe_send_message(chat_id, formatted_msg):
+                             seen_ids.add(msg_id) # Add to seen only if successfully sent and processed
+                        time.sleep(0.7) # Slightly longer delay due to two API calls per message
+                    else:
+                        print(f"Auto-refresh: Error fetching detail for msg {msg_id} for {login}@{domain}: {detail_status} - {msg_detail_data}")
+
 
                 if len(seen_ids) > 100:
                     # Basic strategy to keep seen_ids from growing indefinitely
-                    # Could be improved with timestamp-based eviction if available and reliable
-                    oldest_ids = list(seen_ids)[:-50] 
+                    # Convert to list, sort (they are integers), then slice
+                    sorted_seen_ids = sorted(list(seen_ids))
+                    oldest_ids = sorted_seen_ids[:-50] 
                     for old_id in oldest_ids:
                         seen_ids.discard(old_id)
         except Exception as e:
-            print(f"Error in auto_refresh_worker: {e}")
-        time.sleep(45) # Check interval
+            print(f"Error in auto_refresh_worker: {type(e).__name__} - {e}")
+        time.sleep(60) # Check interval for 1secmail, can be longer
 
 def cleanup_blocked_users():
     while True:
@@ -591,7 +575,7 @@ def process_text_broadcast(message):
         if (i + 1) % 10 == 0 or (i + 1) == total:
             try: 
                 if prog_msg: bot.edit_message_text(prog_text(i+1, success, failed), chat_id, prog_msg.message_id)
-            except Exception: prog_msg = None # Stop trying to edit
+            except Exception: prog_msg = None 
         time.sleep(0.2)
     safe_send_message(chat_id, f"📢 Broadcast Done!\n✅ OK: {success}\n❌ Fail: {failed}", reply_markup=get_admin_keyboard())
 
@@ -623,7 +607,7 @@ def process_media_broadcast(message):
             elif message.video: bot.send_video(user_id, message.video.file_id, caption=caption, parse_mode="Markdown"); sent=True
             elif message.document: bot.send_document(user_id, message.document.file_id, caption=caption, parse_mode="Markdown"); sent=True
             if sent: success +=1
-            else: failed += 1
+            else: failed += 1 # Should not happen if validation is correct
         except Exception: failed +=1
         if (i + 1) % 5 == 0 or (i + 1) == total:
             try:
@@ -636,8 +620,8 @@ def process_media_broadcast(message):
 def back_to_admin(message):
     safe_send_message(message.chat.id, "⬅️ Returning to admin panel...", reply_markup=get_admin_keyboard())
 
-@bot.message_handler(func=lambda msg: msg.text == "⬅️ Main Menu" and is_admin(msg.chat.id)) # Should be specific to admin context if needed
-def admin_back_to_main_from_admin_panel(message): # Renamed for clarity
+@bot.message_handler(func=lambda msg: msg.text == "⬅️ Main Menu" and is_admin(msg.chat.id)) 
+def admin_back_to_main_from_admin_panel(message):
     safe_send_message(message.chat.id, "⬅️ Returning to main menu...", reply_markup=get_main_keyboard(message.chat.id))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('approve_', 'reject_')))
@@ -655,10 +639,10 @@ def handle_approval(call):
     name = user_info.get('name', str(user_id)) if user_info else str(user_id)
 
     if action == "approve":
-        if user_id in pending_approvals or user_id not in approved_users: # Approve if pending or not yet approved
+        if user_id in pending_approvals or user_id not in approved_users:
             approved_users.add(user_id)
             if user_id not in user_profiles and user_info: user_profiles[user_id] = user_info
-            pending_approvals.pop(user_id, None) # Remove from pending if was there
+            pending_approvals.pop(user_id, None) 
             
             safe_send_message(user_id, "✅ Access approved!", reply_markup=get_main_keyboard(user_id))
             bot.answer_callback_query(call.id, f"User {name} approved.")
@@ -667,78 +651,93 @@ def handle_approval(call):
             bot.answer_callback_query(call.id, "Already processed or not pending.")
             bot.edit_message_text(f"⚠️ User `{name}` (`{user_id}`) already processed/not pending.", call.message.chat.id, call.message.message_id, reply_markup=None)
     elif action == "reject":
-        safe_delete_user(user_id) # This handles removal from pending, approved, and other data.
+        safe_delete_user(user_id) 
         safe_send_message(user_id, "❌ Access rejected.")
         bot.answer_callback_query(call.id, f"User {name} rejected.")
         bot.edit_message_text(f"❌ User `{name}` (`{user_id}`) rejected.", call.message.chat.id, call.message.message_id, reply_markup=None)
 
-# --- Mail Handlers ---
+# --- Mail Handlers (1secmail) ---
 @bot.message_handler(func=lambda msg: msg.text == "📬 New mail")
-def new_mail_temp(message):
+def new_mail_1secmail(message):
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)):
         safe_send_message(chat_id, "⏳ Access pending."); return
 
-    user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
-    generating_msg = safe_send_message(chat_id, "⏳ Generating new email...")
-    email_address = generate_temp_mail_address()
+    user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None) # Clear old email data
+    generating_msg = safe_send_message(chat_id, "⏳ Generating new email from 1secmail.com...")
+    
+    status, email_info = generate_1secmail_address()
 
-    if email_address:
-        user_data[chat_id] = {"email": email_address}
+    if status == "SUCCESS" and email_info:
+        user_data[chat_id] = email_info # Stores {"email": login@domain, "login": login, "domain": domain}
         last_message_ids[chat_id] = set() 
-        msg_text = f"✅ *New Email:*\n`{email_address}`\n\nTap to copy. Check with 'Refresh Mail'."
+        msg_text = f"✅ *New Email (1secmail):*\n`{email_info['email']}`\n\nTap to copy. Check with 'Refresh Mail'."
         if generating_msg: bot.edit_message_text(msg_text, chat_id, generating_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, msg_text)
     else:
-        error_text = "❌ Failed to generate email. Try later."
+        error_text = f"❌ Failed to generate email: {email_info or 'Unknown error'}. Try later."
         if generating_msg: bot.edit_message_text(error_text, chat_id, generating_msg.message_id)
         else: safe_send_message(chat_id, error_text)
 
 @bot.message_handler(func=lambda msg: msg.text == "🔄 Refresh Mail")
-def refresh_mail_temp(message):
+def refresh_mail_1secmail(message):
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)):
         safe_send_message(chat_id, "⏳ Access pending."); return
-    if chat_id not in user_data or "email" not in user_data[chat_id]:
+    
+    current_email_info = user_data.get(chat_id)
+    if not current_email_info or "login" not in current_email_info:
         safe_send_message(chat_id, "⚠️ No active email. Use '📬 New mail'."); return
 
-    email_address = user_data[chat_id]["email"]
-    refreshing_msg = safe_send_message(chat_id, f"🔄 Checking inbox for `{email_address}`...")
-    status, mail_api_data = fetch_temp_mail_messages(email_address)
+    login = current_email_info["login"]
+    domain = current_email_info["domain"]
+    full_email = current_email_info["email"]
 
-    if status == "EMPTY":
-        text = f"📭 Inbox for `{email_address}` is empty."
+    refreshing_msg = safe_send_message(chat_id, f"🔄 Checking inbox for `{full_email}`...")
+    
+    list_status, message_summaries = get_1secmail_message_list(login, domain)
+
+    if list_status == "EMPTY":
+        text = f"📭 Inbox for `{full_email}` is empty."
         if refreshing_msg: bot.edit_message_text(text, chat_id, refreshing_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, text)
         return
-    elif status != "SUCCESS":
-        error_text = f"⚠️ Error fetching emails for `{email_address}`: {mail_api_data}\nEmail service might be temporarily unavailable. Try '📬 New mail' or check later."
+    elif list_status != "SUCCESS":
+        error_text = f"⚠️ Error fetching emails for `{full_email}`: {message_summaries}\nEmail service might be temporarily unavailable. Try '📬 New mail' or check later."
         if refreshing_msg: bot.edit_message_text(error_text, chat_id, refreshing_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, error_text)
         return
     
-    messages = mail_api_data 
+    # If SUCCESS, message_summaries is the list
     if refreshing_msg: 
         try: bot.delete_message(chat_id, refreshing_msg.message_id)
         except Exception: pass 
 
-    seen_ids, new_messages_count = last_message_ids.setdefault(chat_id, set()), 0
-    try: messages.sort(key=lambda m: int(m.get('mail_timestamp', 0)), reverse=True)
+    seen_ids = last_message_ids.setdefault(chat_id, set())
+    new_messages_count = 0
+    
+    try: message_summaries.sort(key=lambda m: m.get('date', "0000-00-00 00:00:00"), reverse=True)
     except: pass
 
-    for msg_detail in messages[:10]: 
-        msg_id = msg_detail.get('mail_id')
-        if not msg_id: 
-            msg_id = hashlib.md5((str(msg_detail.get('mail_from','')) + str(msg_detail.get('mail_subject','')) + str(msg_detail.get('mail_timestamp',''))).encode()).hexdigest()
+    for msg_summary in message_summaries[:10]: # Process up to 10 from summary for manual refresh
+        msg_id = msg_summary.get('id')
+        if not isinstance(msg_id, int): continue
+
         if msg_id not in seen_ids: 
-            new_messages_count +=1
-            safe_send_message(chat_id, format_temp_mail_message(msg_detail))
-            seen_ids.add(msg_id); time.sleep(0.3)
+            detail_status, msg_detail_data = read_1secmail_message_detail(login, domain, msg_id)
+            if detail_status == "SUCCESS":
+                new_messages_count +=1
+                formatted_msg = format_1secmail_message(msg_detail_data)
+                if safe_send_message(chat_id, formatted_msg):
+                    seen_ids.add(msg_id) 
+                time.sleep(0.5) # Delay between sending messages
+            else:
+                safe_send_message(chat_id, f"⚠️ Error fetching details for message ID {msg_id}: {msg_detail_data}")
     
-    if new_messages_count == 0: safe_send_message(chat_id, f"✅ No *new* messages in `{email_address}`.")
-    else: safe_send_message(chat_id, f"✨ Found {new_messages_count} new message(s) for `{email_address}`.")
+    if new_messages_count == 0: safe_send_message(chat_id, f"✅ No *new* messages in `{full_email}`.")
+    else: safe_send_message(chat_id, f"✨ Found {new_messages_count} new message(s) for `{full_email}`.")
 
 # --- Profile Handlers ---
 @bot.message_handler(func=lambda msg: msg.text in ["👨 Male Profile", "👩 Female Profile"])
@@ -766,8 +765,9 @@ def show_my_email(message):
     if is_bot_blocked(chat_id): return
     if not (chat_id in approved_users or is_admin(chat_id)):
         safe_send_message(chat_id, "⏳ Access pending."); return
-    email = user_data.get(chat_id, {}).get('email')
-    if email: safe_send_message(chat_id, f"✉️ Current email:\n`{email}`\n\nTap to copy.")
+    email_info = user_data.get(chat_id)
+    if email_info and "email" in email_info: 
+        safe_send_message(chat_id, f"✉️ Current email:\n`{email_info['email']}`\n\nTap to copy.")
     else: safe_send_message(chat_id, "ℹ️ No active email. Use '📬 New mail'.", reply_markup=get_main_keyboard(chat_id))
 
 @bot.message_handler(func=lambda msg: msg.text == "🆔 My Info")
@@ -785,7 +785,7 @@ def show_my_info(message):
     else: safe_send_message(chat_id, "Info not found. Try /start.")
 
 # --- 2FA ---
-STATE_WAITING_FOR_2FA_SECRET = "waiting_for_2fa_secret" # Constant for state key
+STATE_WAITING_FOR_2FA_SECRET = "waiting_for_2fa_secret" 
 user_states = {} 
 
 @bot.message_handler(func=lambda msg: msg.text == "🔐 2FA Auth")
@@ -824,7 +824,7 @@ def handle_2fa_platform_selection(message):
         safe_send_message(chat_id, f"🔢 Enter Base32 2FA secret for *{platform}*:\n(e.g., `JBSWY3DPEHPK3PXP`)\nOr '⬅️ Back'.",
                           reply_markup=get_back_keyboard("2fa_secret_entry"))
 
-@bot.message_handler(func=lambda msg: msg.text == "⬅️ Back to Main") # General back to main
+@bot.message_handler(func=lambda msg: msg.text == "⬅️ Back to Main") 
 def back_to_main_menu_handler(message): 
     chat_id = message.chat.id
     user_states.pop(chat_id, None) 
@@ -841,10 +841,9 @@ def handle_2fa_secret_input(message):
     chat_id = message.chat.id
     secret_input = message.text.strip()
     platform = user_states.get(chat_id, {}).get("platform")
-    if not platform: # Should not happen if state is correct
+    if not platform: 
         safe_send_message(chat_id, "Error: Platform not set. Please start 2FA process again.", reply_markup=get_main_keyboard(chat_id))
-        user_states.pop(chat_id, None)
-        return
+        user_states.pop(chat_id, None); return
 
     if not is_valid_base32(secret_input):
         safe_send_message(chat_id, "❌ *Invalid Secret Key Format* (Use A-Z, 2-7).\nTry again, or '⬅️ Back'.",
@@ -880,11 +879,13 @@ def echo_all(message):
         else: send_welcome(message) 
         return
     
-    current_state = user_states.get(chat_id, {}).get("state")
-    if current_state == STATE_WAITING_FOR_2FA_SECRET and message.text not in ["⬅️ Back to 2FA Platforms", "⬅️ Back to Main"]:
-        # User might be trying to type secret but missed the specific handler context somehow
-        # Or it's a genuine unknown command during 2FA input
-        safe_send_message(message.chat.id, f"Still waiting for 2FA secret for {user_states[chat_id].get('platform', '')} or use Back button.",
+    current_state_info = user_states.get(chat_id, {})
+    current_state = current_state_info.get("state")
+    
+    if current_state == STATE_WAITING_FOR_2FA_SECRET and \
+       message.text not in ["⬅️ Back to 2FA Platforms", "⬅️ Back to Main", "⬅️ Back to User Management", "⬅️ Back to Broadcast Menu", "⬅️ Back to Admin"]: # Check against all back buttons
+        platform_in_state = current_state_info.get('platform', 'the selected platform')
+        safe_send_message(message.chat.id, f"Still waiting for 2FA secret for {platform_in_state} or use a 'Back' button.",
                           reply_markup=get_back_keyboard("2fa_secret_entry"))
         return
 
@@ -893,26 +894,26 @@ def echo_all(message):
 
 # --- Main Loop ---
 if __name__ == '__main__':
-    print("Initializing bot state...")
+    print(f"[{datetime.datetime.now()}] Initializing bot state...")
     user_profiles["bot_start_time"] = datetime.datetime.now() 
-    print("🤖 Bot starting background threads...")
+    print(f"[{datetime.datetime.now()}] Bot starting background threads...")
     threading.Thread(target=auto_refresh_worker, daemon=True).start()
     threading.Thread(target=cleanup_blocked_users, daemon=True).start()
-    print(" पोलिंग शुरू कर रहा हूँ... (Starting polling...)")
+    print(f"[{datetime.datetime.now()}] Starting polling for bot token: ...{BOT_TOKEN[-6:]}")
     
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30, logger_level=None)
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, logger_level=None) 
         except requests.exceptions.ReadTimeout as e_rt:
-            print(f"{datetime.datetime.now()} Polling ReadTimeout: {e_rt}. Retrying in 15s...")
+            print(f"[{datetime.datetime.now()}] Polling ReadTimeout: {e_rt}. Retrying in 15s...")
             time.sleep(15)
         except requests.exceptions.ConnectionError as e_ce:
-            print(f"{datetime.datetime.now()} Polling ConnectionError: {e_ce}. Retrying in 30s...")
+            print(f"[{datetime.datetime.now()}] Polling ConnectionError: {e_ce}. Retrying in 30s...")
             time.sleep(30)
         except Exception as main_loop_e:
-            print(f"{datetime.datetime.now()} CRITICAL ERROR in main polling loop: {main_loop_e}")
-            print("Retrying in 60 seconds...")
+            print(f"[{datetime.datetime.now()}] CRITICAL ERROR in main polling loop: {type(main_loop_e).__name__} - {main_loop_e}")
+            print(f"[{datetime.datetime.now()}] Retrying in 60 seconds...")
             time.sleep(60)
-        else: # Should ideally not be reached if infinity_polling is truly infinite
-            print(f"{datetime.datetime.now()} Polling loop exited cleanly (unexpected). Restarting in 10s...")
+        else: 
+            print(f"[{datetime.datetime.now()}] Polling loop exited cleanly (unexpected). Restarting in 10s...")
             time.sleep(10)
