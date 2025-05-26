@@ -43,19 +43,21 @@ except Exception as e_telebot:
     print(f"[{datetime.datetime.now()}] CRITICAL ERROR: Failed to create TeleBot instance: {e_telebot}. Exiting.")
     raise
 
-# --- API Configuration for GuerrillaMail and Retry Settings ---
-GUERRILLAMAIL_API_URL = "https://api.guerrillamail.com/ajax.php"
+# --- API Configuration for mail.tm and Retry Settings ---
+MAIL_TM_API_BASE_URL = "https://api.mail.tm"
 MAX_RETRIES = 3
 RETRY_DELAY = 3
 REQUESTS_TIMEOUT = 15
 
-HTTP_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'
+HTTP_HEADERS = { # Standard User-Agent
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
+    'Accept': 'application/json', # Common for APIs
+    'Content-Type': 'application/json' # For POST requests
 }
 
 # Data storage
-user_data = {} 
-last_message_ids = {}
+user_data = {} # For mail.tm: {"email": ..., "password": ..., "token": ..., "id": accountId, "account_id_short": ...}
+last_message_ids = {} # Stores set of message IDs from mail.tm
 active_sessions = set()
 pending_approvals = {}
 approved_users = set()
@@ -148,76 +150,119 @@ def safe_send_message(chat_id, text, **kwargs):
         return None
     except Exception as e: print(f"[{datetime.datetime.now()}] Generic Msg Err to {chat_id}: {type(e).__name__} - {e}"); return None
 
-# --- GuerrillaMail API Functions ---
-def generate_guerrillamail_address():
-    params = {'f': 'get_email_address', 'lang': 'en'}
+# --- mail.tm API Functions ---
+def get_mail_tm_domains():
+    """Fetches available domains from mail.tm."""
+    url = f"{MAIL_TM_API_BASE_URL}/domains"
     for attempt in range(MAX_RETRIES):
         try:
-            res = requests.get(GUERRILLAMAIL_API_URL, params=params, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
-            res.raise_for_status(); data = res.json()
-            if data and data.get("email_addr") and data.get("sid_token"):
-                return "SUCCESS", {"email_addr": data["email_addr"], "sid_token": data["sid_token"],
-                                   "alias": data.get("alias",data["email_addr"].split('@')[0]),
-                                   "email_timestamp": data.get("email_timestamp",time.time()), "current_seq_id":0}
-            err = data.get("error","Invalid response (GM gen)") if isinstance(data,dict) else "Invalid response."
-            return "API_ERROR", err
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
-            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code}."
+            res = requests.get(url, params={'page': 1}, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            res.raise_for_status()
+            data = res.json()
+            if data and isinstance(data.get('hydra:member'), list) and data['hydra:member']:
+                return [d['domain'] for d in data['hydra:member'] if 'domain' in d]
+            return None # No domains found or malformed response
         except requests.exceptions.RequestException as e:
-            if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", (f"Net err gen email (GM) after {MAX_RETRIES} attempts. "
-                                           f"Check internet/firewall. Service {GUERRILLAMAIL_API_URL} might be unreachable.")
-        except ValueError: return "JSON_ERROR", "Invalid JSON (GM gen)."
-        except Exception as e: return "API_ERROR", f"Unexp err gen GM email: {str(e)}"
-    return "API_ERROR", "Failed gen GM email after retries."
+            if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
+            else: print(f"[{datetime.datetime.now()}] Net err fetching mail.tm domains: {e}"); return None
+        except (ValueError, KeyError) as e: print(f"[{datetime.datetime.now()}] JSON/Key err mail.tm domains: {e}"); return None
+    return None
 
-def check_guerrillamail_new_emails(sid_token, current_seq_id):
-    params = {'f': 'check_email', 'seq': str(current_seq_id), 'sid_token': sid_token}
+def create_mail_tm_account(address, password):
+    """Creates an account on mail.tm."""
+    url = f"{MAIL_TM_API_BASE_URL}/accounts"
+    payload = {"address": address, "password": password}
     for attempt in range(MAX_RETRIES):
         try:
-            res = requests.get(GUERRILLAMAIL_API_URL, params=params, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
-            res.raise_for_status(); data = res.json()
-            if "error" in data:
-                if "sid_token_expired" in data["error"] or "sid_token_invalid" in data["error"]: return "SESSION_EXPIRED", data['error']
-                return "API_ERROR", data['error']
-            if "list" in data and isinstance(data["list"], list):
-                return "EMPTY" if not data["list"] else "SUCCESS", {"emails": data["list"], "new_seq_id": data.get("seq", current_seq_id)}
-            return "API_ERROR", "Unexp resp GM email list."
+            res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            if res.status_code == 201: # Created
+                return "CREATED", res.json()
+            elif res.status_code == 400: # Bad request (e.g., address already exists if not handled by 422)
+                 # mail.tm uses 422 for "address: This value is already used."
+                return "EXISTS_OR_BAD_REQUEST", res.json().get('hydra:description', 'Bad request or address exists.')
+            elif res.status_code == 422: # Unprocessable entity (validation error, e.g. address exists)
+                 return "EXISTS", res.json().get('hydra:description', 'Address likely already exists.')
+            res.raise_for_status() # For other 4xx/5xx errors
+            return "ERROR", "Unknown response creating mail.tm account." # Should be caught by raise_for_status
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
-            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code} for list."
+            if e.response.status_code in [500,502,503,504] and attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} creating mail.tm account."
         except requests.exceptions.RequestException as e:
-            if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", f"Net err GM list after {MAX_RETRIES} attempts."
-        except ValueError: return "JSON_ERROR", "Invalid JSON GM email list."
-        except Exception as e: return "API_ERROR", f"Unexp err GM list: {str(e)}"
-    return "API_ERROR", "Failed GM email list after retries."
+            if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
+            else: return "NETWORK_ERROR", f"Net err creating mail.tm account after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON creating mail.tm account."
+    return "API_ERROR", "Failed to create mail.tm account after retries."
 
-def fetch_guerrillamail_email_detail(email_id, sid_token):
-    params = {'f': 'fetch_email', 'email_id': str(email_id), 'sid_token': sid_token}
+
+def get_mail_tm_token(address, password):
+    """Gets an auth token from mail.tm."""
+    url = f"{MAIL_TM_API_BASE_URL}/token"
+    payload = {"address": address, "password": password}
     for attempt in range(MAX_RETRIES):
         try:
-            res = requests.get(GUERRILLAMAIL_API_URL, params=params, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
-            res.raise_for_status(); data = res.json()
-            if "error" in data:
-                if "sid_token_expired" in data["error"] or "sid_token_invalid" in data["error"]: return "SESSION_EXPIRED", data['error']
-                return "API_ERROR", data['error']
-            if isinstance(data, dict) and 'mail_id' in data: return "SUCCESS", data
-            return "API_ERROR", "Unexp resp GM email detail."
+            res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            res.raise_for_status()
+            data = res.json()
+            if data and data.get('token') and data.get('id'):
+                return "SUCCESS", data # Contains token and account id
+            return "API_ERROR", "Token or ID not found in mail.tm response."
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
-            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code} for detail."
+            if e.response.status_code in [500,502,503,504] and attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} getting mail.tm token."
         except requests.exceptions.RequestException as e:
-            if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", f"Net err GM detail after {MAX_RETRIES} attempts."
-        except ValueError: return "JSON_ERROR", "Invalid JSON GM email detail."
-        except Exception as e: return "API_ERROR", f"Unexp err GM detail: {str(e)}"
-    return "API_ERROR", "Failed GM email detail after retries."
+            if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
+            else: return "NETWORK_ERROR", f"Net err getting mail.tm token after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON getting mail.tm token."
+    return "API_ERROR", "Failed to get mail.tm token after retries."
+
+def get_mail_tm_messages(token):
+    """Fetches message list from mail.tm using a token."""
+    url = f"{MAIL_TM_API_BASE_URL}/messages"
+    auth_headers = {**HTTP_HEADERS, 'Authorization': f'Bearer {token}'}
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.get(url, headers=auth_headers, timeout=REQUESTS_TIMEOUT)
+            if res.status_code == 401: return "AUTH_ERROR", "Invalid or expired token for mail.tm."
+            res.raise_for_status()
+            data = res.json()
+            if isinstance(data.get('hydra:member'), list):
+                return "EMPTY" if not data['hydra:member'] else "SUCCESS", data['hydra:member']
+            return "API_ERROR", "Unexpected response for mail.tm message list."
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [500,502,503,504] and attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} getting mail.tm messages."
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
+            else: return "NETWORK_ERROR", f"Net err getting mail.tm messages after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON for mail.tm messages."
+    return "API_ERROR", "Failed to get mail.tm messages after retries."
+
+def get_mail_tm_message_detail(token, message_id_path): # message_id_path is like "/messages/some-uuid"
+    """Fetches a specific message detail from mail.tm."""
+    url = f"{MAIL_TM_API_BASE_URL}{message_id_path}" # mail.tm API uses full path from summary
+    auth_headers = {**HTTP_HEADERS, 'Authorization': f'Bearer {token}'}
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.get(url, headers=auth_headers, timeout=REQUESTS_TIMEOUT)
+            if res.status_code == 401: return "AUTH_ERROR", "Invalid or expired token for mail.tm detail."
+            res.raise_for_status()
+            data = res.json()
+            if isinstance(data, dict) and data.get('id'): # Check for presence of 'id'
+                return "SUCCESS", data
+            return "API_ERROR", "Unexpected response for mail.tm message detail."
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [500,502,503,504] and attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} getting mail.tm detail."
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
+            else: return "NETWORK_ERROR", f"Net err getting mail.tm detail after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON for mail.tm detail."
+    return "API_ERROR", "Failed to get mail.tm detail after retries."
+
 
 # --- Profile Generator ---
 def generate_username(): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
-def generate_password(): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=8)) + datetime.datetime.now().strftime("%d")
+def generate_password(): return ''.join(random.choices(string.ascii_letters+string.digits,k=12)) # Stronger random password
 def generate_us_phone(): return f"1{random.randint(200,999)}{''.join([str(random.randint(0,9)) for _ in range(7)])}"
 def generate_profile(gender):
     name = fake.name_male() if gender=="male" else fake.name_female()
@@ -232,22 +277,32 @@ def is_valid_base32(s):
     except: return False
 
 # --- Email Formatting & Background Workers ---
-def format_guerrillamail_message(msg_detail):
-    sender = msg_detail.get('mail_from', 'N/A')
-    subject = msg_detail.get('mail_subject', '(No Subject)')
-    body_content = msg_detail.get('mail_body', '') 
-    if body_content:
-        body_content = re.sub(r'<style[^>]*?>.*?</style>','',body_content,flags=re.DOTALL|re.IGNORECASE)
-        body_content = re.sub(r'<script[^>]*?>.*?</script>','',body_content,flags=re.DOTALL|re.IGNORECASE)
-        body_content = re.sub(r'<br\s*/?>','\n',body_content,flags=re.IGNORECASE)
-        body_content = re.sub(r'</p>','\n</p>',body_content,flags=re.IGNORECASE) 
-        body_content = re.sub(r'<[^>]+>','',body_content)
-        body_content = body_content.replace('&nbsp;',' ').replace('&amp;','&').replace('&lt;','<').replace('&gt;','>')
-        body_content = '\n'.join([ln.strip() for ln in body_content.splitlines() if ln.strip()])
+def format_mail_tm_message(msg_detail):
+    sender_info = msg_detail.get('from', {})
+    sender = sender_info.get('address', 'N/A') if isinstance(sender_info, dict) else 'N/A'
+    subject = msg_detail.get('subject', '(No Subject)')
+    body_content = msg_detail.get('text', '') # mail.tm provides 'text' and 'html'
+    if not body_content and msg_detail.get('html'):
+        html_body_list = msg_detail.get('html', [])
+        if html_body_list and isinstance(html_body_list, list):
+            html_body = html_body_list[0] # Take the first HTML part
+            body_content = re.sub(r'<style[^>]*?>.*?</style>','',html_body,flags=re.DOTALL|re.IGNORECASE)
+            body_content = re.sub(r'<script[^>]*?>.*?</script>','',body_content,flags=re.DOTALL|re.IGNORECASE)
+            body_content = re.sub(r'<br\s*/?>','\n',body_content,flags=re.IGNORECASE)
+            body_content = re.sub(r'</p>','\n</p>',body_content,flags=re.IGNORECASE) 
+            body_content = re.sub(r'<[^>]+>','',body_content)
+            body_content = body_content.replace('&nbsp;',' ').replace('&amp;','&').replace('&lt;','<').replace('&gt;','>')
+            body_content = '\n'.join([ln.strip() for ln in body_content.splitlines() if ln.strip()])
     body_content = body_content.strip() if body_content else "(No Content)"
-    ts = msg_detail.get('mail_timestamp', time.time()); recv_time = "Unknown"
-    try: recv_time = datetime.datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S UTC')
-    except: pass 
+    
+    # createdAt: "2024-05-27T00:50:01+00:00"
+    recv_time_str = msg_detail.get('createdAt', 'Just now')
+    try:
+        dt_obj = datetime.datetime.fromisoformat(recv_time_str.replace("Z", "+00:00"))
+        recv_time = dt_obj.strftime('%Y-%m-%d %H:%M:%S UTC')
+    except:
+        recv_time = recv_time_str # Fallback to raw string if parsing fails
+
     return (f"━━━━━━━━━━━━━━━━━━━━\n📬*New Email!*\n━━━━━━━━━━━━━━━━━━━━\n"
             f"👤*From:* `{sender}`\n📨*Subject:* _{subject}_\n🕒*Received:* {recv_time}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n💬*Body:*\n{body_content[:3500]}\n━━━━━━━━━━━━━━━━━━━━")
@@ -259,40 +314,52 @@ def auto_refresh_worker():
             for chat_id in list(user_data.keys()):
                 if is_bot_blocked(chat_id) or (chat_id not in approved_users and not is_admin(chat_id)):
                     safe_delete_user(chat_id); continue
-                session_info = user_data.get(chat_id)
-                if not session_info or "sid_token" not in session_info: continue
-                sid_token, cur_seq = session_info["sid_token"], session_info.get("current_seq_id", 0)
-                list_status, mail_data = check_guerrillamail_new_emails(sid_token, cur_seq)
-
-                if list_status == "SESSION_EXPIRED":
-                    print(f"[{datetime.datetime.now()}] Auto-refresh: Session expired for {chat_id}. Clearing data.")
-                    user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
-                    safe_send_message(chat_id, "⏳ GuerrillaMail session expired. Use '📬 New mail'."); continue
-                if list_status not in ["SUCCESS", "EMPTY"]:
-                    print(f"[{datetime.datetime.now()}] Auto-refresh: Err chk mail {chat_id}: {list_status}-{mail_data}"); continue
-                if list_status == "EMPTY" or not mail_data or not mail_data.get("emails"): continue
-
-                new_emails, new_seq = mail_data["emails"], mail_data.get("new_seq_id", cur_seq)
-                seen_ids = last_message_ids.setdefault(chat_id, set())
-                new_emails.sort(key=lambda m: m.get('mail_id', 0))
-
-                for msg_summary in new_emails:
-                    msg_id = msg_summary.get('mail_id')
-                    if not msg_id or int(msg_id) in seen_ids: continue
-                    detail_status, detail_data = fetch_guerrillamail_email_detail(msg_id, sid_token)
-                    if detail_status == "SUCCESS":
-                        if safe_send_message(chat_id, format_guerrillamail_message(detail_data)): seen_ids.add(int(msg_id))
-                        time.sleep(0.7)
-                    elif detail_status == "SESSION_EXPIRED":
-                        print(f"[{datetime.datetime.now()}] Auto-refresh: Session expired (detail fetch) for {chat_id}. Clearing."); 
-                        user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
-                        safe_send_message(chat_id, "⏳ Email session expired. Use '📬 New mail'."); break 
-                    else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_id} ({chat_id}): {detail_status}-{detail_data}")
                 
-                if chat_id in user_data: user_data[chat_id]["current_seq_id"] = new_seq
-                if len(seen_ids)>150: oldest=sorted(list(seen_ids))[:-75]; [seen_ids.discard(oid) for oid in oldest]
+                session_info = user_data.get(chat_id)
+                if not session_info or "token" not in session_info: continue
+                token = session_info["token"]
+                
+                list_status, messages_summary = get_mail_tm_messages(token)
+
+                if list_status == "AUTH_ERROR":
+                    print(f"[{datetime.datetime.now()}] Auto-refresh: Auth error for {chat_id}. Clearing data.")
+                    user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
+                    safe_send_message(chat_id, "⚠️ Your mail.tm session token expired or is invalid. Please use '📬 New mail' to get a new one.")
+                    continue
+                if list_status not in ["SUCCESS", "EMPTY"]:
+                    print(f"[{datetime.datetime.now()}] Auto-refresh: Err fetching mail.tm list for {chat_id}: {list_status}-{messages_summary}"); continue
+                if list_status == "EMPTY" or not messages_summary: continue
+
+                seen_ids = last_message_ids.setdefault(chat_id, set())
+                # mail.tm messages are usually sorted newest first by API
+                # messages_summary.sort(key=lambda m: m.get('createdAt', "0"), reverse=True)
+
+
+                for msg_summary in messages_summary[:5]: # Check top 5 recent
+                    msg_id_path = msg_summary.get('id') # This is the path like "/messages/uuid"
+                    unique_msg_identifier = msg_summary.get('@id', msg_id_path) # Use @id if available, else path
+
+                    if not msg_id_path or unique_msg_identifier in seen_ids: continue
+                    
+                    detail_status, detail_data = get_mail_tm_message_detail(token, msg_id_path)
+                    if detail_status == "SUCCESS":
+                        if safe_send_message(chat_id, format_mail_tm_message(detail_data)):
+                            seen_ids.add(unique_msg_identifier)
+                        time.sleep(0.7)
+                    elif detail_status == "AUTH_ERROR":
+                        print(f"[{datetime.datetime.now()}] Auto-refresh: Auth error for {chat_id} (detail fetch). Clearing data."); 
+                        user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
+                        safe_send_message(chat_id, "⚠️ Mail.tm session token invalid. Use '📬 New mail'."); break 
+                    else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_id_path} ({chat_id}): {detail_status}-{detail_data}")
+                
+                if len(seen_ids)>150: # Prune old seen IDs
+                    # No easy way to sort these UUID paths, just take a random sample to prune if too large
+                    if len(seen_ids) > 200: # Be more aggressive if it gets very large
+                        ids_to_keep = random.sample(list(seen_ids), 75)
+                        last_message_ids[chat_id] = set(ids_to_keep)
+
         except Exception as e: print(f"[{datetime.datetime.now()}] Error in auto_refresh_worker: {type(e).__name__} - {e}")
-        time.sleep(45)
+        time.sleep(30) # mail.tm can be polled a bit more frequently
 
 def cleanup_blocked_users():
     print(f"[{datetime.datetime.now()}] Cleanup_blocked_users worker started.")
@@ -319,9 +386,10 @@ def send_welcome(m):
             except ValueError: print(f"[{datetime.datetime.now()}] ADMIN_ID '{ADMIN_ID}' invalid."); return
             safe_send_message(adm_cid,msg_text,reply_markup=get_approval_keyboard(cid))
 
+# (Admin Panel, User Management, Broadcast, Profile, Account, 2FA handlers - kept concise but functional)
+# ... (These handlers are largely the same as before, ensure they function correctly) ...
 @bot.message_handler(func=lambda msg: msg.text == "👑 Admin Panel" and is_admin(msg.chat.id))
 def admin_panel(message): safe_send_message(message.chat.id, "👑 Admin Panel", reply_markup=get_admin_keyboard())
-
 @bot.message_handler(func=lambda msg: msg.text == "👥 Pending Approvals" and is_admin(msg.chat.id))
 def show_pending_approvals(message):
     if not pending_approvals: safe_send_message(message.chat.id, "✅ No pending approvals."); return
@@ -331,7 +399,6 @@ def show_pending_approvals(message):
         text = (f"*Pending {count}*\nID:`{user_id}`\nName:`{name}`\nUser:@{uname}\nJoined:`{joined}`")
         safe_send_message(message.chat.id, text, reply_markup=get_approval_keyboard(user_id)); time.sleep(0.1)
     if count == 0: safe_send_message(message.chat.id, "✅ No pending approvals after iterating.")
-
 @bot.message_handler(func=lambda msg: msg.text == "📊 Stats" and is_admin(msg.chat.id))
 def show_stats(message):
     start_time = user_profiles.get("bot_start_time"); up, s_str="N/A","N/A"
@@ -339,10 +406,8 @@ def show_stats(message):
     if start_time:
         s_str=start_time.strftime('%y-%m-%d %H:%M'); delta=datetime.datetime.now()-start_time; d,r=delta.days,delta.seconds; h,r=divmod(r,3600);mn,_=divmod(r,60); up=f"{d}d {h}h {mn}m"
     safe_send_message(message.chat.id,f"📊*Stats*\n👑Adm:`{ADMIN_ID}`\n👥Appr:`{len(approved_users)}`\n👤ActSess:`{len(active_sessions)}`\n⏳Pend:`{len(pending_approvals)}`\n📧EmailsAct:`{len(user_data)}`\n🚀Start:`{s_str}`\n⏱Up:`{up}`")
-
 @bot.message_handler(func=lambda msg: msg.text == "👤 User Management" and is_admin(msg.chat.id))
 def user_mgmt(message): safe_send_message(message.chat.id,"👤User Mgmt",reply_markup=get_user_management_keyboard())
-
 @bot.message_handler(func=lambda msg: msg.text == "📜 List Users" and is_admin(msg.chat.id))
 def list_users(message):
     if not approved_users: safe_send_message(message.chat.id,"❌No users."); return
@@ -355,43 +420,30 @@ def list_users(message):
             p_info = user_profiles.get(uid, {}); user_list_str += f"- `{uid}`: {p_info.get('name', '?')} (@{p_info.get('username','?')})\n"
             count += 1
     safe_send_message(message.chat.id, user_list_str)
-
 @bot.message_handler(func=lambda msg: msg.text == "❌ Remove User" and is_admin(msg.chat.id))
 def remove_prompt(message): safe_send_message(message.chat.id,"🆔Enter User ID:",reply_markup=get_back_keyboard("admin_user_management")); bot.register_next_step_handler(message,proc_removal)
-
 def proc_removal(m):
     cid=m.chat.id; kbd=get_user_management_keyboard()
     if m.text=="⬅️ Back to User Management": safe_send_message(cid,"Cancelled.",reply_markup=kbd); return
     try: uid_to_remove=int(m.text.strip())
     except ValueError: safe_send_message(cid,"❌Invalid ID.",reply_markup=kbd); return
-    
-    if ADMIN_ID and uid_to_remove == int(ADMIN_ID): # Check if ADMIN_ID is set before comparing
-        safe_send_message(cid, "❌ Cannot remove admin!", reply_markup=kbd); return
-        
+    if ADMIN_ID and uid_to_remove == int(ADMIN_ID): safe_send_message(cid, "❌ Cannot remove admin!", reply_markup=kbd); return
     was_appr,was_p=uid_to_remove in approved_users,uid_to_remove in pending_approvals; n=user_profiles.get(uid_to_remove,{}).get('name',str(uid_to_remove))
-    if was_appr or was_p: 
-        safe_delete_user(uid_to_remove); safe_send_message(cid,f"✅User `{n}`({uid_to_remove}) removed.",reply_markup=kbd)
-        if not is_bot_blocked(uid_to_remove): safe_send_message(uid_to_remove,"❌Access revoked.")
+    if was_appr or was_p: safe_delete_user(uid_to_remove); safe_send_message(cid,f"✅User `{n}`({uid_to_remove}) removed.",reply_markup=kbd); safe_send_message(uid_to_remove,"❌Access revoked.") if not is_bot_blocked(uid_to_remove) else None
     else: safe_send_message(cid,f"❌User {uid_to_remove} not found.",reply_markup=kbd)
-
 @bot.message_handler(func=lambda msg: msg.text == "📢 Broadcast" and is_admin(msg.chat.id))
 def broadcast_menu(m): safe_send_message(m.chat.id,"📢Choose:",reply_markup=get_broadcast_keyboard())
-
 @bot.message_handler(func=lambda msg: msg.text == "📢 Text Broadcast" and is_admin(msg.chat.id))
 def text_bc_prompt(m): safe_send_message(m.chat.id,"✍️Enter msg (/cancel):",reply_markup=get_back_keyboard("admin_broadcast")); bot.register_next_step_handler(m,proc_text_bc)
-
 def proc_text_bc(m):
     cid=m.chat.id; kbd=get_broadcast_keyboard()
     if m.text in ["⬅️ Back to Broadcast Menu","/cancel"]: safe_send_message(cid,"Cancelled.",reply_markup=kbd); return
     if not m.text: safe_send_message(cid,"Empty. Cancelled.",reply_markup=kbd); return
-    
     users_to_send = [u for u in approved_users if ADMIN_ID and u != int(ADMIN_ID)] if ADMIN_ID else list(approved_users)
     s,f,t=0,0,len(users_to_send); adm_kbd=get_admin_keyboard()
-
-    if t==0: safe_send_message(cid,"No users to broadcast to (excluding admin).",reply_markup=adm_kbd); return
+    if t==0: safe_send_message(cid,"No users to broadcast to (excl admin).",reply_markup=adm_kbd); return
     pt=lambda i,sc,fl:f"📢Brdcst\nSnt:{i}/{t}\n✅OK:{sc}❌Fail:{fl}"; pm=safe_send_message(cid,pt(0,0,0))
     if not pm: safe_send_message(cid,"Err starting broadcast.",reply_markup=adm_kbd); return
-
     for i,uid in enumerate(users_to_send):
         if safe_send_message(uid,f"📢*Admin Broadcast:*\n\n{m.text}"): s+=1
         else: f+=1
@@ -399,51 +451,39 @@ def proc_text_bc(m):
             try: 
                 if pm: bot.edit_message_text(pt(i+1,s,f),cid,pm.message_id)
             except Exception as e_edit: pm=None; print(f"[{datetime.datetime.now()}] Err updating broadcast prog: {e_edit}")
-        time.sleep(0.2) # Be nice to API
+        time.sleep(0.2)
     safe_send_message(cid,f"📢Done!\n✅OK:{s}❌Fail:{f}",reply_markup=adm_kbd)
-
 @bot.message_handler(func=lambda msg: msg.text == "📋 Media Broadcast" and is_admin(msg.chat.id))
 def media_bc_prompt(m): safe_send_message(m.chat.id,"🖼Send media&caption (/cancel):",reply_markup=get_back_keyboard("admin_broadcast")); bot.register_next_step_handler(m,proc_media_bc)
-
-def proc_media_bc(m): # Fixed SyntaxError here
+def proc_media_bc(m):
     cid=m.chat.id; kbd=get_broadcast_keyboard()
     if m.text in ["⬅️ Back to Broadcast Menu","/cancel"]: safe_send_message(cid,"Cancelled.",reply_markup=kbd); return
     if not (m.photo or m.video or m.document): safe_send_message(cid,"No media. Cancelled.",reply_markup=kbd); return
-    
     users_to_send = [u for u in approved_users if ADMIN_ID and u != int(ADMIN_ID)] if ADMIN_ID else list(approved_users)
     s,f,t=0,0,len(users_to_send); adm_kbd=get_admin_keyboard()
-
-    if t==0: safe_send_message(cid,"No users to broadcast to (excluding admin).",reply_markup=adm_kbd); return
+    if t==0: safe_send_message(cid,"No users to broadcast to (excl admin).",reply_markup=adm_kbd); return
     pt=lambda i,sc,fl:f"📢Media Brdcst\nSnt:{i}/{t}\n✅OK:{sc}❌Fail:{fl}"; pm=safe_send_message(cid,pt(0,0,0))
     if not pm: safe_send_message(cid,"Err starting media broadcast.",reply_markup=adm_kbd); return
-
     cap=f"📢*Admin Media Broadcast:*\n\n{m.caption or ''}".strip()
     for i,uid in enumerate(users_to_send):
-        try: # THIS TRY NOW HAS AN EXCEPT BLOCK
+        try:
             sent=False
             if m.photo: bot.send_photo(uid,m.photo[-1].file_id,caption=cap,parse_mode="Markdown");sent=True
             elif m.video: bot.send_video(uid,m.video.file_id,caption=cap,parse_mode="Markdown");sent=True
             elif m.document: bot.send_document(uid,m.document.file_id,caption=cap,parse_mode="Markdown");sent=True
-            
             if sent: s+=1
-            else: f+=1 # Should only happen if no media type matched, though validated earlier.
-        except Exception as e_media_send: # Catch errors during sending
-            f+=1
-            print(f"[{datetime.datetime.now()}] Error sending media to {uid}: {e_media_send}")
-
+            else: f+=1
+        except Exception as e_media_send: f+=1; print(f"[{datetime.datetime.now()}] Error sending media to {uid}: {e_media_send}")
         if (i+1)%5==0 or (i+1)==t: 
             try: 
                 if pm: bot.edit_message_text(pt(i+1,s,f),cid,pm.message_id)
             except Exception as e_edit_media: pm=None; print(f"[{datetime.datetime.now()}] Err updating media broadcast prog: {e_edit_media}")
         time.sleep(0.3)
     safe_send_message(cid,f"📢Media Done!\n✅OK:{s}❌Fail:{f}",reply_markup=adm_kbd)
-
 @bot.message_handler(func=lambda m: m.text=="⬅️ Back to Admin" and is_admin(m.chat.id))
 def back_to_admin(m): safe_send_message(m.chat.id,"⬅️To admin",reply_markup=get_admin_keyboard())
-
-@bot.message_handler(func=lambda m: m.text=="⬅️ Main Menu" and is_admin(m.chat.id)) # This is for Admin going back to their main menu
-def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main menu",reply_markup=get_main_keyboard(m.chat.id))
-
+@bot.message_handler(func=lambda m: m.text=="⬅️ Main Menu" and is_admin(m.chat.id))
+def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main",reply_markup=get_main_keyboard(m.chat.id))
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_','reject_')))
 def handle_approval(c):
     if not is_admin(c.message.chat.id): bot.answer_callback_query(c.id,"❌Not allowed."); return
@@ -451,65 +491,83 @@ def handle_approval(c):
     except: bot.answer_callback_query(c.id,"Err."); bot.edit_message_text("Err.",c.message.chat.id,c.message.message_id); return
     info=pending_approvals.get(uid,user_profiles.get(uid)); n=info.get('name',str(uid)) if info else str(uid)
     if act=="approve":
-        if uid in pending_approvals or uid not in approved_users: 
-            approved_users.add(uid); 
-            if uid not in user_profiles and info: user_profiles[uid]=info # Store profile if approving
-            pending_approvals.pop(uid,None); 
-            safe_send_message(uid,"✅Access approved!",reply_markup=get_main_keyboard(uid)); 
-            bot.answer_callback_query(c.id,f"User {n} approved.")
-            bot.edit_message_text(f"✅User `{n}`({uid}) approved.",c.message.chat.id,c.message.message_id,reply_markup=None)
-        else: bot.answer_callback_query(c.id,"Already processed."); bot.edit_message_text(f"⚠️User `{n}`({uid}) already processed.",c.message.chat.id,c.message.message_id,reply_markup=None)
-    elif act=="reject": 
-        safe_delete_user(uid); safe_send_message(uid,"❌Access rejected.")
-        bot.answer_callback_query(c.id,f"User {n} rejected.")
-        bot.edit_message_text(f"❌User `{n}`({uid}) rejected.",c.message.chat.id,c.message.message_id,reply_markup=None)
+        if uid in pending_approvals or uid not in approved_users: approved_users.add(uid); (user_profiles[uid]:=info) if uid not in user_profiles and info else None; pending_approvals.pop(uid,None); safe_send_message(uid,"✅Access approved!",reply_markup=get_main_keyboard(uid)); bot.answer_callback_query(c.id,f"User {n} approved."); bot.edit_message_text(f"✅User `{n}`({uid}) approved.",c.message.chat.id,c.message.message_id,reply_markup=None)
+        else: bot.answer_callback_query(c.id,"Processed."); bot.edit_message_text(f"⚠️User `{n}`({uid}) already processed.",c.message.chat.id,c.message.message_id,reply_markup=None)
+    elif act=="reject": safe_delete_user(uid); safe_send_message(uid,"❌Access rejected."); bot.answer_callback_query(c.id,f"User {n} rejected."); bot.edit_message_text(f"❌User `{n}`({uid}) rejected.",c.message.chat.id,c.message.message_id,reply_markup=None)
 
-# --- Mail Handlers (GuerrillaMail) ---
+# --- Mail Handlers (mail.tm) ---
 @bot.message_handler(func=lambda msg: msg.text == "📬 New mail")
-def new_mail_guerrillamail(message):
+def new_mail_mail_tm(message):
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)): safe_send_message(chat_id, "⏳ Access pending."); return
+    
     user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
-    gen_msg = safe_send_message(chat_id, "⏳ Generating new email (GuerrillaMail)...")
-    status, email_data = generate_guerrillamail_address()
+    gen_msg = safe_send_message(chat_id, "⏳ Generating new email (mail.tm)...")
 
-    if status == "SUCCESS" and email_data:
-        user_data[chat_id] = email_data
+    domains = get_mail_tm_domains()
+    if not domains:
+        err_txt = "❌ Failed to get domains from mail.tm. Service might be unavailable. Try later."
+        if gen_msg: bot.edit_message_text(err_txt, chat_id, gen_msg.message_id); else: safe_send_message(chat_id, err_txt)
+        return
+    
+    domain = random.choice(domains)
+    local_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    email_address = f"{local_part}@{domain}"
+    password = generate_password() # Use our strong password generator
+
+    status_create, acc_data = create_mail_tm_account(email_address, password)
+
+    if status_create not in ["CREATED", "EXISTS"]: # EXISTS means we might be able to get a token
+        err_txt = f"❌ Failed to create mail.tm account for `{email_address}`: {acc_data}. Try again or check service."
+        if gen_msg: bot.edit_message_text(err_txt, chat_id, gen_msg.message_id, parse_mode="Markdown"); else: safe_send_message(chat_id, err_txt)
+        return
+
+    # Account created or already exists, try to get token
+    status_token, token_data = get_mail_tm_token(email_address, password)
+    if status_token == "SUCCESS" and token_data:
+        user_data[chat_id] = {
+            "email": email_address, 
+            "password": password, 
+            "token": token_data["token"],
+            "id": token_data["id"], # This is the account ID from mail.tm
+            "account_id_short": token_data["id"].split('/')[-1] if token_data["id"] else "N/A" # For display if needed
+        }
         last_message_ids[chat_id] = set() 
-        msg_txt = f"✅ *New Email (GuerrillaMail):*\n`{email_data['email_addr']}`\n\nTap to copy. Use 'Refresh Mail'."
+        msg_txt = f"✅ *New Email (mail.tm):*\n`{email_address}`\n\nTap to copy. Use 'Refresh Mail'."
         if gen_msg: bot.edit_message_text(msg_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, msg_txt)
     else:
-        error_txt = f"❌ Failed to generate email: {email_data}.\nThis often means a network problem from the bot's location trying to reach GuerrillaMail. Please check your server's internet connection, firewall, DNS, or try again much later. The service might also be temporarily unavailable."
-        if gen_msg: bot.edit_message_text(error_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
-        else: safe_send_message(chat_id, error_txt)
+        error_txt = f"❌ Failed to get token for mail.tm account `{email_address}`: {token_data}. Service issue or account conflict."
+        if gen_msg: bot.edit_message_text(error_txt, chat_id, gen_msg.message_id, parse_mode="Markdown"); else: safe_send_message(chat_id, error_txt)
+
 
 @bot.message_handler(func=lambda msg: msg.text == "🔄 Refresh Mail")
-def refresh_mail_guerrillamail(message):
+def refresh_mail_mail_tm(message):
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)): safe_send_message(chat_id, "⏳ Access pending."); return
     
     session_info = user_data.get(chat_id)
-    if not session_info or "sid_token" not in session_info:
-        safe_send_message(chat_id, "⚠️ No active GuerrillaMail session. Use '📬 New mail'."); return
+    if not session_info or "token" not in session_info:
+        safe_send_message(chat_id, "⚠️ No active mail.tm session. Use '📬 New mail'."); return
 
-    email_addr, sid_token, cur_seq = session_info["email_addr"], session_info["sid_token"], session_info.get("current_seq_id", 0)
-    refresh_msg = safe_send_message(chat_id, f"🔄 Checking inbox for `{email_addr}` (GuerrillaMail)...")
-    list_status, mail_data = check_guerrillamail_new_emails(sid_token, cur_seq)
+    email_addr, token = session_info["email"], session_info["token"]
+    refresh_msg = safe_send_message(chat_id, f"🔄 Checking inbox for `{email_addr}` (mail.tm)...")
+    
+    list_status, messages_summary = get_mail_tm_messages(token)
 
-    if list_status == "SESSION_EXPIRED":
+    if list_status == "AUTH_ERROR":
         user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
-        err_txt = f"⏳ Email session for `{email_addr}` expired. Use '📬 New mail'."
+        err_txt = f"⚠️ Mail.tm token for `{email_addr}` expired/invalid. Use '📬 New mail'."
         if refresh_msg: bot.edit_message_text(err_txt, chat_id, refresh_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, err_txt); return
     elif list_status == "EMPTY":
-        txt = f"📭 Inbox for `{email_addr}` is empty or no new messages."
+        txt = f"📭 Inbox for `{email_addr}` is empty."
         if refresh_msg: bot.edit_message_text(txt, chat_id, refresh_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, txt); return
     elif list_status != "SUCCESS":
-        err_txt = f"⚠️ Error fetching emails for `{email_addr}`: {mail_data}\nGuerrillaMail service might be unavailable or network issues. Try '📬 New mail' or later."
+        err_txt = f"⚠️ Error fetching emails for `{email_addr}`: {messages_summary}\nMail.tm service might be unavailable. Try later or '📬 New mail'."
         if refresh_msg: bot.edit_message_text(err_txt, chat_id, refresh_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, err_txt); return
     
@@ -517,26 +575,30 @@ def refresh_mail_guerrillamail(message):
         try: bot.delete_message(chat_id, refresh_msg.message_id)
         except: pass 
 
-    new_emails, new_seq = mail_data.get("emails", []), mail_data.get("new_seq_id", cur_seq)
     seen_ids, new_count = last_message_ids.setdefault(chat_id, set()), 0
-    new_emails.sort(key=lambda m: m.get('mail_id', 0))
+    # mail.tm API usually returns newest first
+    # messages_summary.sort(key=lambda m: m.get('createdAt', "0"), reverse=True) 
 
-    for msg_summary in new_emails: 
-        msg_id = msg_summary.get('mail_id')
-        if not msg_id or int(msg_id) in seen_ids: continue
-        detail_status, detail_data = fetch_guerrillamail_email_detail(msg_id, sid_token)
+    for msg_summary in messages_summary[:10]: # Process up to 10 for manual refresh
+        msg_id_path = msg_summary.get('id') # This is the API path like "/messages/..."
+        unique_identifier = msg_summary.get('@id', msg_id_path) # Use @id (full IRI) if available
+
+        if not msg_id_path or unique_identifier in seen_ids: continue
+        
+        detail_status, detail_data = get_mail_tm_message_detail(token, msg_id_path)
         if detail_status == "SUCCESS":
             new_count +=1
-            if safe_send_message(chat_id, format_guerrillamail_message(detail_data)): seen_ids.add(int(msg_id))
+            if safe_send_message(chat_id, format_mail_tm_message(detail_data)): 
+                seen_ids.add(unique_identifier)
             time.sleep(0.5)
-        elif detail_status == "SESSION_EXPIRED":
+        elif detail_status == "AUTH_ERROR":
             user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
-            safe_send_message(chat_id, "⏳ Email session expired while fetching. Use '📬 New mail'."); break
-        else: safe_send_message(chat_id, f"⚠️ Error fetching detail for msg ID {msg_id}: {detail_data}")
+            safe_send_message(chat_id, "⚠️ Mail.tm token invalid fetching details. Use '📬 New mail'."); break
+        else: safe_send_message(chat_id, f"⚠️ Error fetching detail for msg ({msg_id_path}): {detail_data}")
     
-    if chat_id in user_data : user_data[chat_id]["current_seq_id"] = new_seq
     if new_count == 0: safe_send_message(chat_id, f"✅ No *new* messages in `{email_addr}` since last check.")
     else: safe_send_message(chat_id, f"✨ Found {new_count} new message(s) for `{email_addr}`.")
+
 
 # --- Profile & Account ---
 @bot.message_handler(func=lambda m:m.text in ["👨 Male Profile","👩 Female Profile"])
@@ -556,8 +618,8 @@ def show_my_email(m):
     cid=m.chat.id;
     if is_bot_blocked(cid): return
     if not (cid in approved_users or is_admin(cid)): safe_send_message(cid,"⏳Access pending."); return
-    email=user_data.get(cid,{}).get('email_addr')
-    if email: safe_send_message(cid,f"✉️Current GuerrillaMail:\n`{email}`\nTap to copy.")
+    email=user_data.get(cid,{}).get('email') # mail.tm stores it as 'email'
+    if email: safe_send_message(cid,f"✉️Current mail.tm Email:\n`{email}`\nTap to copy.")
     else: safe_send_message(cid,"ℹ️No active email. Use '📬 New mail'.",reply_markup=get_main_keyboard(cid))
 @bot.message_handler(func=lambda m:m.text=="🆔 My Info")
 def show_my_info(m):
@@ -628,7 +690,7 @@ if __name__ == '__main__':
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=30, logger_level=None, none_stop=True)
-            print(f"[{datetime.datetime.now()}] Warning: infinity_polling loop has exited. Restarting...") # Should not happen with none_stop
+            print(f"[{datetime.datetime.now()}] Warning: infinity_polling loop has exited. Restarting...")
         except requests.exceptions.ReadTimeout as e_rt:
             print(f"[{datetime.datetime.now()}] Polling ReadTimeout: {e_rt}. Retrying in 15s...")
             time.sleep(15)
@@ -641,7 +703,7 @@ if __name__ == '__main__':
         except Exception as main_loop_e:
             print(f"[{datetime.datetime.now()}] CRITICAL ERROR in main polling loop: {type(main_loop_e).__name__} - {main_loop_e}")
             import traceback
-            traceback.print_exc() # Print full traceback for crash diagnosis
+            traceback.print_exc() 
             print(f"[{datetime.datetime.now()}] Retrying polling in 60 seconds...")
             time.sleep(60)
         else: 
