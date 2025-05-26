@@ -28,13 +28,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN:
-    print(f"[{datetime.datetime.now()}] CRITICAL ERROR: BOT_TOKEN not set in environment variables or .env file. Exiting.")
+    print(f"[{datetime.datetime.now()}] CRITICAL ERROR: BOT_TOKEN not set. Exiting.")
     raise Exception("❌ BOT_TOKEN not set.")
 if not ADMIN_ID:
-    print(f"[{datetime.datetime.now()}] WARNING: ADMIN_ID not set. Admin features will not work correctly.")
-    # Allow to run without ADMIN_ID for non-admin operations, or raise Exception if critical
+    print(f"[{datetime.datetime.now()}] WARNING: ADMIN_ID not set. Admin features might not work as expected.")
 
-print(f"[{datetime.datetime.now()}] BOT_TOKEN loaded: ...{BOT_TOKEN[-6:]}")
+print(f"[{datetime.datetime.now()}] BOT_TOKEN loaded: ...{BOT_TOKEN[-6:] if BOT_TOKEN else 'NONE'}")
 print(f"[{datetime.datetime.now()}] ADMIN_ID loaded: {ADMIN_ID if ADMIN_ID else 'NOT SET'}")
 
 try:
@@ -54,7 +53,7 @@ HTTP_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'
 }
 
-# Data storage (in-memory, will be lost on restart)
+# Data storage
 user_data = {} 
 last_message_ids = {}
 active_sessions = set()
@@ -65,7 +64,7 @@ user_2fa_secrets = {}
 
 # --- Helper Functions ---
 def is_admin(chat_id): 
-    if not ADMIN_ID: return False # No admin if ADMIN_ID is not set
+    if not ADMIN_ID: return False
     return str(chat_id) == str(ADMIN_ID)
 
 def safe_delete_user(chat_id):
@@ -77,10 +76,8 @@ def safe_delete_user(chat_id):
         pending_approvals.pop(chat_id, None)
         approved_users.discard(chat_id)
         user_profiles.pop(chat_id, None)
-        # print(f"[{datetime.datetime.now()}] Safely deleted data for user {chat_id}")
     except Exception as e:
         print(f"[{datetime.datetime.now()}] Error in safe_delete_user for {chat_id}: {e}")
-
 
 def is_bot_blocked(chat_id):
     try: 
@@ -91,7 +88,7 @@ def is_bot_blocked(chat_id):
                "bot was blocked" in e.result_json.get("description", "")
     except Exception as e_block_check:
         print(f"[{datetime.datetime.now()}] Error checking if bot is blocked for {chat_id}: {e_block_check}")
-        return False # Assume not blocked if an unexpected error occurs here
+        return False
 
 def get_user_info(user):
     return {"name": user.first_name + (f" {user.last_name}" if user.last_name else ""),
@@ -154,36 +151,26 @@ def safe_send_message(chat_id, text, **kwargs):
 # --- GuerrillaMail API Functions ---
 def generate_guerrillamail_address():
     params = {'f': 'get_email_address', 'lang': 'en'}
-    # print(f"[{datetime.datetime.now()}] DEBUG GM: Requesting new email. URL: {GUERRILLAMAIL_API_URL} PARAMS: {params}")
     for attempt in range(MAX_RETRIES):
         try:
             res = requests.get(GUERRILLAMAIL_API_URL, params=params, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
-            res.raise_for_status()
-            data = res.json()
+            res.raise_for_status(); data = res.json()
             if data and data.get("email_addr") and data.get("sid_token"):
-                # print(f"[{datetime.datetime.now()}] DEBUG GM: Email generated: {data['email_addr']}")
-                return "SUCCESS", {
-                    "email_addr": data["email_addr"], "sid_token": data["sid_token"],
-                    "alias": data.get("alias", data["email_addr"].split('@')[0]),
-                    "email_timestamp": data.get("email_timestamp", time.time()), "current_seq_id": 0
-                }
-            err_msg = data.get("error", "Invalid response from GuerrillaMail gen.") if isinstance(data, dict) else "Invalid response."
-            # print(f"[{datetime.datetime.now()}] DEBUG GM: Failed parse: {err_msg} Response: {data}")
-            return "API_ERROR", err_msg
+                return "SUCCESS", {"email_addr": data["email_addr"], "sid_token": data["sid_token"],
+                                   "alias": data.get("alias",data["email_addr"].split('@')[0]),
+                                   "email_timestamp": data.get("email_timestamp",time.time()), "current_seq_id":0}
+            err = data.get("error","Invalid response (GM gen)") if isinstance(data,dict) else "Invalid response."
+            return "API_ERROR", err
         except requests.exceptions.HTTPError as e:
-            # print(f"[{datetime.datetime.now()}] DEBUG GM: HTTP err gen (att {attempt+1}): {e.response.status_code} - {e.response.text[:100]}")
             if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
-            return "API_ERROR", f"GuerrillaMail service HTTP {e.response.status_code}."
+            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code}."
         except requests.exceptions.RequestException as e:
-            # print(f"[{datetime.datetime.now()}] DEBUG GM: Net err gen (att {attempt+1}): {type(e).__name__} - {e}")
             if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", (f"Net err gen email (GuerrillaMail) after {MAX_RETRIES} attempts. "
-                                           f"Check internet/firewall. Service at {GUERRILLAMAIL_API_URL} might be unreachable.")
-        except ValueError: # print(f"[{datetime.datetime.now()}] DEBUG GM: JSON err gen email."); 
-            return "JSON_ERROR", "Invalid JSON response from GuerrillaMail generation."
-        except Exception as e: # print(f"[{datetime.datetime.now()}] DEBUG GM: Unexp err gen email: {type(e).__name__} - {e}"); 
-            return "API_ERROR", f"Unexpected error generating GuerrillaMail email: {str(e)}"
-    return "API_ERROR", "Failed to generate email from GuerrillaMail after retries."
+            else: return "NETWORK_ERROR", (f"Net err gen email (GM) after {MAX_RETRIES} attempts. "
+                                           f"Check internet/firewall. Service {GUERRILLAMAIL_API_URL} might be unreachable.")
+        except ValueError: return "JSON_ERROR", "Invalid JSON (GM gen)."
+        except Exception as e: return "API_ERROR", f"Unexp err gen GM email: {str(e)}"
+    return "API_ERROR", "Failed gen GM email after retries."
 
 def check_guerrillamail_new_emails(sid_token, current_seq_id):
     params = {'f': 'check_email', 'seq': str(current_seq_id), 'sid_token': sid_token}
@@ -196,16 +183,16 @@ def check_guerrillamail_new_emails(sid_token, current_seq_id):
                 return "API_ERROR", data['error']
             if "list" in data and isinstance(data["list"], list):
                 return "EMPTY" if not data["list"] else "SUCCESS", {"emails": data["list"], "new_seq_id": data.get("seq", current_seq_id)}
-            return "API_ERROR", "Unexpected response for GuerrillaMail email list."
+            return "API_ERROR", "Unexp resp GM email list."
         except requests.exceptions.HTTPError as e:
             if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
-            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code} for email list."
+            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code} for list."
         except requests.exceptions.RequestException as e:
             if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", f"Net err fetching GuerrillaMail list after {MAX_RETRIES} attempts."
-        except ValueError: return "JSON_ERROR", "Invalid JSON for GuerrillaMail email list."
-        except Exception as e: return "API_ERROR", f"Unexp err fetching GuerrillaMail list: {str(e)}"
-    return "API_ERROR", "Failed to fetch GuerrillaMail email list after retries."
+            else: return "NETWORK_ERROR", f"Net err GM list after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON GM email list."
+        except Exception as e: return "API_ERROR", f"Unexp err GM list: {str(e)}"
+    return "API_ERROR", "Failed GM email list after retries."
 
 def fetch_guerrillamail_email_detail(email_id, sid_token):
     params = {'f': 'fetch_email', 'email_id': str(email_id), 'sid_token': sid_token}
@@ -217,16 +204,16 @@ def fetch_guerrillamail_email_detail(email_id, sid_token):
                 if "sid_token_expired" in data["error"] or "sid_token_invalid" in data["error"]: return "SESSION_EXPIRED", data['error']
                 return "API_ERROR", data['error']
             if isinstance(data, dict) and 'mail_id' in data: return "SUCCESS", data
-            return "API_ERROR", "Unexpected response for GuerrillaMail email detail."
+            return "API_ERROR", "Unexp resp GM email detail."
         except requests.exceptions.HTTPError as e:
             if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
-            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code} for email detail."
+            return "API_ERROR", f"GuerrillaMail HTTP {e.response.status_code} for detail."
         except requests.exceptions.RequestException as e:
             if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", f"Net err fetching GuerrillaMail detail after {MAX_RETRIES} attempts."
-        except ValueError: return "JSON_ERROR", "Invalid JSON for GuerrillaMail email detail."
-        except Exception as e: return "API_ERROR", f"Unexp err fetching GuerrillaMail detail: {str(e)}"
-    return "API_ERROR", "Failed to fetch GuerrillaMail email detail after retries."
+            else: return "NETWORK_ERROR", f"Net err GM detail after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON GM email detail."
+        except Exception as e: return "API_ERROR", f"Unexp err GM detail: {str(e)}"
+    return "API_ERROR", "Failed GM email detail after retries."
 
 # --- Profile Generator ---
 def generate_username(): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
@@ -248,7 +235,7 @@ def is_valid_base32(s):
 def format_guerrillamail_message(msg_detail):
     sender = msg_detail.get('mail_from', 'N/A')
     subject = msg_detail.get('mail_subject', '(No Subject)')
-    body_content = msg_detail.get('mail_body', '') # mail_body is HTML
+    body_content = msg_detail.get('mail_body', '') 
     if body_content:
         body_content = re.sub(r'<style[^>]*?>.*?</style>','',body_content,flags=re.DOTALL|re.IGNORECASE)
         body_content = re.sub(r'<script[^>]*?>.*?</script>','',body_content,flags=re.DOTALL|re.IGNORECASE)
@@ -258,11 +245,9 @@ def format_guerrillamail_message(msg_detail):
         body_content = body_content.replace('&nbsp;',' ').replace('&amp;','&').replace('&lt;','<').replace('&gt;','>')
         body_content = '\n'.join([ln.strip() for ln in body_content.splitlines() if ln.strip()])
     body_content = body_content.strip() if body_content else "(No Content)"
-    ts = msg_detail.get('mail_timestamp', time.time())
-    recv_time = "Unknown"
+    ts = msg_detail.get('mail_timestamp', time.time()); recv_time = "Unknown"
     try: recv_time = datetime.datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S UTC')
-    except: pass # Keep "Unknown" if timestamp is invalid
-
+    except: pass 
     return (f"━━━━━━━━━━━━━━━━━━━━\n📬*New Email!*\n━━━━━━━━━━━━━━━━━━━━\n"
             f"👤*From:* `{sender}`\n📨*Subject:* _{subject}_\n🕒*Received:* {recv_time}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n💬*Body:*\n{body_content[:3500]}\n━━━━━━━━━━━━━━━━━━━━")
@@ -271,47 +256,41 @@ def auto_refresh_worker():
     print(f"[{datetime.datetime.now()}] Auto-refresh worker started.")
     while True:
         try:
-            for chat_id in list(user_data.keys()): # Iterate over a copy of keys
+            for chat_id in list(user_data.keys()):
                 if is_bot_blocked(chat_id) or (chat_id not in approved_users and not is_admin(chat_id)):
                     safe_delete_user(chat_id); continue
                 session_info = user_data.get(chat_id)
                 if not session_info or "sid_token" not in session_info: continue
-
-                sid_token, current_seq_id = session_info["sid_token"], session_info.get("current_seq_id", 0)
-                list_status, mail_data = check_guerrillamail_new_emails(sid_token, current_seq_id)
+                sid_token, cur_seq = session_info["sid_token"], session_info.get("current_seq_id", 0)
+                list_status, mail_data = check_guerrillamail_new_emails(sid_token, cur_seq)
 
                 if list_status == "SESSION_EXPIRED":
                     print(f"[{datetime.datetime.now()}] Auto-refresh: Session expired for {chat_id}. Clearing data.")
-                    user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
-                    safe_send_message(chat_id, "⏳ Your GuerrillaMail session expired. Use '📬 New mail'.")
-                    continue
+                    user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
+                    safe_send_message(chat_id, "⏳ GuerrillaMail session expired. Use '📬 New mail'."); continue
                 if list_status not in ["SUCCESS", "EMPTY"]:
                     print(f"[{datetime.datetime.now()}] Auto-refresh: Err chk mail {chat_id}: {list_status}-{mail_data}"); continue
                 if list_status == "EMPTY" or not mail_data or not mail_data.get("emails"): continue
 
-                new_emails, new_seq = mail_data["emails"], mail_data.get("new_seq_id", current_seq_id)
+                new_emails, new_seq = mail_data["emails"], mail_data.get("new_seq_id", cur_seq)
                 seen_ids = last_message_ids.setdefault(chat_id, set())
                 new_emails.sort(key=lambda m: m.get('mail_id', 0))
 
                 for msg_summary in new_emails:
                     msg_id = msg_summary.get('mail_id')
                     if not msg_id or int(msg_id) in seen_ids: continue
-                    
                     detail_status, detail_data = fetch_guerrillamail_email_detail(msg_id, sid_token)
                     if detail_status == "SUCCESS":
-                        if safe_send_message(chat_id, format_guerrillamail_message(detail_data)):
-                            seen_ids.add(int(msg_id))
+                        if safe_send_message(chat_id, format_guerrillamail_message(detail_data)): seen_ids.add(int(msg_id))
                         time.sleep(0.7)
                     elif detail_status == "SESSION_EXPIRED":
-                        print(f"[{datetime.datetime.now()}] Auto-refresh: Session expired for {chat_id} (detail fetch). Clearing data."); 
+                        print(f"[{datetime.datetime.now()}] Auto-refresh: Session expired (detail fetch) for {chat_id}. Clearing."); 
                         user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
                         safe_send_message(chat_id, "⏳ Email session expired. Use '📬 New mail'."); break 
                     else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_id} ({chat_id}): {detail_status}-{detail_data}")
                 
-                if chat_id in user_data: # Check if user data was cleared due to session expiry
-                    user_data[chat_id]["current_seq_id"] = new_seq
-                if len(seen_ids) > 150:
-                    oldest = sorted(list(seen_ids))[:-75]; [seen_ids.discard(oid) for oid in oldest]
+                if chat_id in user_data: user_data[chat_id]["current_seq_id"] = new_seq
+                if len(seen_ids)>150: oldest=sorted(list(seen_ids))[:-75]; [seen_ids.discard(oid) for oid in oldest]
         except Exception as e: print(f"[{datetime.datetime.now()}] Error in auto_refresh_worker: {type(e).__name__} - {e}")
         time.sleep(45)
 
@@ -324,36 +303,35 @@ def cleanup_blocked_users():
         except Exception as e: print(f"[{datetime.datetime.now()}] Err cleanup: {type(e).__name__} - {e}")
         time.sleep(3600) 
 
-# --- Bot Handlers (Simplified for brevity, logic largely same as before) ---
+# --- Bot Handlers ---
 @bot.message_handler(commands=['start','help'])
 def send_welcome(m):
     cid=m.chat.id; 
-    if is_bot_blocked(cid): safe_delete_user(cid); return # Moved block check earlier
+    if is_bot_blocked(cid): safe_delete_user(cid); return
     info=get_user_info(m.from_user); user_profiles[cid]=info
     if is_admin(cid): approved_users.add(cid); safe_send_message(cid,"👋 Admin!",reply_markup=get_main_keyboard(cid)); return
     if cid in approved_users: safe_send_message(cid,"👋 Welcome Back!",reply_markup=get_main_keyboard(cid))
     else:
-        if cid not in pending_approvals: pending_approvals[cid]=info; safe_send_message(cid,"👋 Access request sent. Please wait for approval by admin.")
-        else: safe_send_message(cid,"⏳ Your access request is still pending admin approval.")
+        if cid not in pending_approvals: pending_approvals[cid]=info; safe_send_message(cid,"👋 Access request sent. Wait for admin approval.")
+        else: safe_send_message(cid,"⏳ Access request pending admin approval.")
         if ADMIN_ID:
-            try: adm_cid=int(ADMIN_ID); msg=(f"🆕*Approval Request*\nID:`{cid}`\nName:`{info['name']}`\nUser:`@{info['username']}`\nJoined:`{info['join_date']}`")
-            except ValueError: print(f"[{datetime.datetime.now()}] ADMIN_ID '{ADMIN_ID}' is not a valid integer."); return
-            safe_send_message(adm_cid,msg,reply_markup=get_approval_keyboard(cid))
+            try: adm_cid=int(ADMIN_ID); msg_text=(f"🆕*Approval Req*\nID:`{cid}`\nN:`{info['name']}`\nU:`@{info['username']}`\nJ:`{info['join_date']}`")
+            except ValueError: print(f"[{datetime.datetime.now()}] ADMIN_ID '{ADMIN_ID}' invalid."); return
+            safe_send_message(adm_cid,msg_text,reply_markup=get_approval_keyboard(cid))
 
-# (Admin Panel, User Management, Broadcast, Profile, Account, 2FA handlers - kept concise but functional)
-# ... (These handlers are long, assume they are similar to previous version with minor adjustments for brevity) ...
-# --- Admin Panel ---
 @bot.message_handler(func=lambda msg: msg.text == "👑 Admin Panel" and is_admin(msg.chat.id))
 def admin_panel(message): safe_send_message(message.chat.id, "👑 Admin Panel", reply_markup=get_admin_keyboard())
+
 @bot.message_handler(func=lambda msg: msg.text == "👥 Pending Approvals" and is_admin(msg.chat.id))
 def show_pending_approvals(message):
     if not pending_approvals: safe_send_message(message.chat.id, "✅ No pending approvals."); return
     count = 0
     for user_id, info in list(pending_approvals.items()): 
-        count +=1; name, uname, joined = info.get('name', str(user_id)), info.get('username', 'N/A'), info.get('join_date', 'N/A')
-        text = (f"*Pending {count}*\nID: `{user_id}`\nName: `{name}`\nUser: @{uname}\nJoined: `{joined}`")
+        count +=1; name, uname, joined = info.get('name',str(user_id)), info.get('username','N/A'), info.get('join_date','N/A')
+        text = (f"*Pending {count}*\nID:`{user_id}`\nName:`{name}`\nUser:@{uname}\nJoined:`{joined}`")
         safe_send_message(message.chat.id, text, reply_markup=get_approval_keyboard(user_id)); time.sleep(0.1)
     if count == 0: safe_send_message(message.chat.id, "✅ No pending approvals after iterating.")
+
 @bot.message_handler(func=lambda msg: msg.text == "📊 Stats" and is_admin(msg.chat.id))
 def show_stats(message):
     start_time = user_profiles.get("bot_start_time"); up, s_str="N/A","N/A"
@@ -361,72 +339,130 @@ def show_stats(message):
     if start_time:
         s_str=start_time.strftime('%y-%m-%d %H:%M'); delta=datetime.datetime.now()-start_time; d,r=delta.days,delta.seconds; h,r=divmod(r,3600);mn,_=divmod(r,60); up=f"{d}d {h}h {mn}m"
     safe_send_message(message.chat.id,f"📊*Stats*\n👑Adm:`{ADMIN_ID}`\n👥Appr:`{len(approved_users)}`\n👤ActSess:`{len(active_sessions)}`\n⏳Pend:`{len(pending_approvals)}`\n📧EmailsAct:`{len(user_data)}`\n🚀Start:`{s_str}`\n⏱Up:`{up}`")
+
 @bot.message_handler(func=lambda msg: msg.text == "👤 User Management" and is_admin(msg.chat.id))
 def user_mgmt(message): safe_send_message(message.chat.id,"👤User Mgmt",reply_markup=get_user_management_keyboard())
+
 @bot.message_handler(func=lambda msg: msg.text == "📜 List Users" and is_admin(msg.chat.id))
-def list_users(message): # Simplified list users
+def list_users(message):
     if not approved_users: safe_send_message(message.chat.id,"❌No users."); return
     user_list_str = "👥 *Approved Users:*\n"
     if not approved_users: user_list_str += "_None_"
     else:
-        for uid in list(approved_users)[:50]: # Show max 50 to avoid too long message
-            p_info = user_profiles.get(uid, {})
-            user_list_str += f"- `{uid}`: {p_info.get('name', '?')} (@{p_info.get('username','?')})\n"
-        if len(approved_users) > 50 : user_list_str += f"...and {len(approved_users)-50} more."
+        count = 0
+        for uid in list(approved_users):
+            if count >= 50: user_list_str += f"...and {len(approved_users)-count} more.\n"; break
+            p_info = user_profiles.get(uid, {}); user_list_str += f"- `{uid}`: {p_info.get('name', '?')} (@{p_info.get('username','?')})\n"
+            count += 1
     safe_send_message(message.chat.id, user_list_str)
+
 @bot.message_handler(func=lambda msg: msg.text == "❌ Remove User" and is_admin(msg.chat.id))
 def remove_prompt(message): safe_send_message(message.chat.id,"🆔Enter User ID:",reply_markup=get_back_keyboard("admin_user_management")); bot.register_next_step_handler(message,proc_removal)
+
 def proc_removal(m):
     cid=m.chat.id; kbd=get_user_management_keyboard()
     if m.text=="⬅️ Back to User Management": safe_send_message(cid,"Cancelled.",reply_markup=kbd); return
-    try: uid=int(m.text.strip()); assert uid!=int(ADMIN_ID if ADMIN_ID else -1) # Avoid removing admin
-    except: safe_send_message(cid,"❌Invalid ID/Can't remove admin.",reply_markup=kbd); return
-    was_a,was_p=uid in approved_users,uid in pending_approvals; n=user_profiles.get(uid,{}).get('name',str(uid))
-    if was_a or was_p: safe_delete_user(uid); safe_send_message(cid,f"✅User `{n}`({uid}) removed.",reply_markup=kbd); safe_send_message(uid,"❌Access revoked.") if not is_bot_blocked(uid) else None
-    else: safe_send_message(cid,f"❌User {uid} not found.",reply_markup=kbd)
+    try: uid_to_remove=int(m.text.strip())
+    except ValueError: safe_send_message(cid,"❌Invalid ID.",reply_markup=kbd); return
+    
+    if ADMIN_ID and uid_to_remove == int(ADMIN_ID): # Check if ADMIN_ID is set before comparing
+        safe_send_message(cid, "❌ Cannot remove admin!", reply_markup=kbd); return
+        
+    was_appr,was_p=uid_to_remove in approved_users,uid_to_remove in pending_approvals; n=user_profiles.get(uid_to_remove,{}).get('name',str(uid_to_remove))
+    if was_appr or was_p: 
+        safe_delete_user(uid_to_remove); safe_send_message(cid,f"✅User `{n}`({uid_to_remove}) removed.",reply_markup=kbd)
+        if not is_bot_blocked(uid_to_remove): safe_send_message(uid_to_remove,"❌Access revoked.")
+    else: safe_send_message(cid,f"❌User {uid_to_remove} not found.",reply_markup=kbd)
+
 @bot.message_handler(func=lambda msg: msg.text == "📢 Broadcast" and is_admin(msg.chat.id))
 def broadcast_menu(m): safe_send_message(m.chat.id,"📢Choose:",reply_markup=get_broadcast_keyboard())
+
 @bot.message_handler(func=lambda msg: msg.text == "📢 Text Broadcast" and is_admin(msg.chat.id))
 def text_bc_prompt(m): safe_send_message(m.chat.id,"✍️Enter msg (/cancel):",reply_markup=get_back_keyboard("admin_broadcast")); bot.register_next_step_handler(m,proc_text_bc)
-def proc_text_bc(m): # Simplified broadcast
+
+def proc_text_bc(m):
     cid=m.chat.id; kbd=get_broadcast_keyboard()
     if m.text in ["⬅️ Back to Broadcast Menu","/cancel"]: safe_send_message(cid,"Cancelled.",reply_markup=kbd); return
     if not m.text: safe_send_message(cid,"Empty. Cancelled.",reply_markup=kbd); return
-    users_to_send = [u for u in approved_users if u != int(ADMIN_ID if ADMIN_ID else -1)] # Exclude admin
-    s,f = 0,0
-    for uid in users_to_send: (s:=s+1) if safe_send_message(uid,f"📢*Admin Broadcast:*\n\n{m.text}") else (f:=f+1); time.sleep(0.1)
-    safe_send_message(cid,f"📢Text Broadcast Done!\n✅Sent: {s}\n❌Failed: {f}",reply_markup=get_admin_keyboard())
+    
+    users_to_send = [u for u in approved_users if ADMIN_ID and u != int(ADMIN_ID)] if ADMIN_ID else list(approved_users)
+    s,f,t=0,0,len(users_to_send); adm_kbd=get_admin_keyboard()
+
+    if t==0: safe_send_message(cid,"No users to broadcast to (excluding admin).",reply_markup=adm_kbd); return
+    pt=lambda i,sc,fl:f"📢Brdcst\nSnt:{i}/{t}\n✅OK:{sc}❌Fail:{fl}"; pm=safe_send_message(cid,pt(0,0,0))
+    if not pm: safe_send_message(cid,"Err starting broadcast.",reply_markup=adm_kbd); return
+
+    for i,uid in enumerate(users_to_send):
+        if safe_send_message(uid,f"📢*Admin Broadcast:*\n\n{m.text}"): s+=1
+        else: f+=1
+        if (i+1)%10==0 or (i+1)==t: 
+            try: 
+                if pm: bot.edit_message_text(pt(i+1,s,f),cid,pm.message_id)
+            except Exception as e_edit: pm=None; print(f"[{datetime.datetime.now()}] Err updating broadcast prog: {e_edit}")
+        time.sleep(0.2) # Be nice to API
+    safe_send_message(cid,f"📢Done!\n✅OK:{s}❌Fail:{f}",reply_markup=adm_kbd)
+
 @bot.message_handler(func=lambda msg: msg.text == "📋 Media Broadcast" and is_admin(msg.chat.id))
 def media_bc_prompt(m): safe_send_message(m.chat.id,"🖼Send media&caption (/cancel):",reply_markup=get_back_keyboard("admin_broadcast")); bot.register_next_step_handler(m,proc_media_bc)
-def proc_media_bc(m): # Simplified media broadcast
+
+def proc_media_bc(m): # Fixed SyntaxError here
     cid=m.chat.id; kbd=get_broadcast_keyboard()
     if m.text in ["⬅️ Back to Broadcast Menu","/cancel"]: safe_send_message(cid,"Cancelled.",reply_markup=kbd); return
     if not (m.photo or m.video or m.document): safe_send_message(cid,"No media. Cancelled.",reply_markup=kbd); return
-    users_to_send = [u for u in approved_users if u != int(ADMIN_ID if ADMIN_ID else -1)]
-    s,f=0,0; cap=f"📢*Admin Broadcast:*\n\n{m.caption or ''}".strip()
-    for uid in users_to_send:
-        try: sent=False
+    
+    users_to_send = [u for u in approved_users if ADMIN_ID and u != int(ADMIN_ID)] if ADMIN_ID else list(approved_users)
+    s,f,t=0,0,len(users_to_send); adm_kbd=get_admin_keyboard()
+
+    if t==0: safe_send_message(cid,"No users to broadcast to (excluding admin).",reply_markup=adm_kbd); return
+    pt=lambda i,sc,fl:f"📢Media Brdcst\nSnt:{i}/{t}\n✅OK:{sc}❌Fail:{fl}"; pm=safe_send_message(cid,pt(0,0,0))
+    if not pm: safe_send_message(cid,"Err starting media broadcast.",reply_markup=adm_kbd); return
+
+    cap=f"📢*Admin Media Broadcast:*\n\n{m.caption or ''}".strip()
+    for i,uid in enumerate(users_to_send):
+        try: # THIS TRY NOW HAS AN EXCEPT BLOCK
+            sent=False
             if m.photo: bot.send_photo(uid,m.photo[-1].file_id,caption=cap,parse_mode="Markdown");sent=True
             elif m.video: bot.send_video(uid,m.video.file_id,caption=cap,parse_mode="Markdown");sent=True
             elif m.document: bot.send_document(uid,m.document.file_id,caption=cap,parse_mode="Markdown");sent=True
-            (s:=s+1) if sent else (f:=f+1)
-        except: f:=f+1
-        time.sleep(0.1)
-    safe_send_message(cid,f"📢Media Broadcast Done!\n✅Sent: {s}\n❌Failed: {f}",reply_markup=get_admin_keyboard())
+            
+            if sent: s+=1
+            else: f+=1 # Should only happen if no media type matched, though validated earlier.
+        except Exception as e_media_send: # Catch errors during sending
+            f+=1
+            print(f"[{datetime.datetime.now()}] Error sending media to {uid}: {e_media_send}")
+
+        if (i+1)%5==0 or (i+1)==t: 
+            try: 
+                if pm: bot.edit_message_text(pt(i+1,s,f),cid,pm.message_id)
+            except Exception as e_edit_media: pm=None; print(f"[{datetime.datetime.now()}] Err updating media broadcast prog: {e_edit_media}")
+        time.sleep(0.3)
+    safe_send_message(cid,f"📢Media Done!\n✅OK:{s}❌Fail:{f}",reply_markup=adm_kbd)
+
 @bot.message_handler(func=lambda m: m.text=="⬅️ Back to Admin" and is_admin(m.chat.id))
 def back_to_admin(m): safe_send_message(m.chat.id,"⬅️To admin",reply_markup=get_admin_keyboard())
-@bot.message_handler(func=lambda m: m.text=="⬅️ Main Menu" and is_admin(m.chat.id))
-def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main",reply_markup=get_main_keyboard(m.chat.id))
+
+@bot.message_handler(func=lambda m: m.text=="⬅️ Main Menu" and is_admin(m.chat.id)) # This is for Admin going back to their main menu
+def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main menu",reply_markup=get_main_keyboard(m.chat.id))
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_','reject_')))
-def handle_approval(c): # Simplified approval
+def handle_approval(c):
     if not is_admin(c.message.chat.id): bot.answer_callback_query(c.id,"❌Not allowed."); return
     try: act,uid_s=c.data.split('_'); uid=int(uid_s)
     except: bot.answer_callback_query(c.id,"Err."); bot.edit_message_text("Err.",c.message.chat.id,c.message.message_id); return
     info=pending_approvals.get(uid,user_profiles.get(uid)); n=info.get('name',str(uid)) if info else str(uid)
     if act=="approve":
-        if uid in pending_approvals or uid not in approved_users: approved_users.add(uid); (user_profiles[uid]:=info) if uid not in user_profiles and info else None; pending_approvals.pop(uid,None); safe_send_message(uid,"✅Access approved!",reply_markup=get_main_keyboard(uid)); bot.answer_callback_query(c.id,f"User {n} approved."); bot.edit_message_text(f"✅User `{n}`({uid}) approved.",c.message.chat.id,c.message.message_id,reply_markup=None)
-        else: bot.answer_callback_query(c.id,"Processed."); bot.edit_message_text(f"⚠️User `{n}`({uid}) processed.",c.message.chat.id,c.message.message_id,reply_markup=None)
-    elif act=="reject": safe_delete_user(uid); safe_send_message(uid,"❌Access rejected."); bot.answer_callback_query(c.id,f"User {n} rejected."); bot.edit_message_text(f"❌User `{n}`({uid}) rejected.",c.message.chat.id,c.message.message_id,reply_markup=None)
+        if uid in pending_approvals or uid not in approved_users: 
+            approved_users.add(uid); 
+            if uid not in user_profiles and info: user_profiles[uid]=info # Store profile if approving
+            pending_approvals.pop(uid,None); 
+            safe_send_message(uid,"✅Access approved!",reply_markup=get_main_keyboard(uid)); 
+            bot.answer_callback_query(c.id,f"User {n} approved.")
+            bot.edit_message_text(f"✅User `{n}`({uid}) approved.",c.message.chat.id,c.message.message_id,reply_markup=None)
+        else: bot.answer_callback_query(c.id,"Already processed."); bot.edit_message_text(f"⚠️User `{n}`({uid}) already processed.",c.message.chat.id,c.message.message_id,reply_markup=None)
+    elif act=="reject": 
+        safe_delete_user(uid); safe_send_message(uid,"❌Access rejected.")
+        bot.answer_callback_query(c.id,f"User {n} rejected.")
+        bot.edit_message_text(f"❌User `{n}`({uid}) rejected.",c.message.chat.id,c.message.message_id,reply_markup=None)
 
 # --- Mail Handlers (GuerrillaMail) ---
 @bot.message_handler(func=lambda msg: msg.text == "📬 New mail")
@@ -532,7 +568,7 @@ def show_my_info(m):
     if info: safe_send_message(cid,f"👤*Info:*\nN:`{info.get('name','?')}`\nU:`@{info.get('username','?')}`\nJ:`{info.get('join_date','?')}`\nID:`{cid}`")
     else: safe_send_message(cid,"Info not found. Try /start.")
 
-# --- 2FA --- (Simplified handlers for brevity)
+# --- 2FA --- 
 STATE_WAITING_FOR_2FA_SECRET = "waiting_for_2fa_secret" 
 user_states = {} 
 @bot.message_handler(func=lambda m:m.text=="🔐 2FA Auth")
@@ -555,7 +591,7 @@ def back_2fa_plat(m):user_states[m.chat.id]={"state":"2fa_platform_select"};safe
 @bot.message_handler(func=lambda m:user_states.get(m.chat.id,{}).get("state")==STATE_WAITING_FOR_2FA_SECRET)
 def handle_2fa_secret_in(m):
     cid,s_in=m.chat.id,m.text.strip();plat=user_states.get(cid,{}).get("platform")
-    if not plat:safe_send_message(cid,"Err:Platform not set.Start again.",reply_markup=get_main_keyboard(cid));user_states.pop(cid,None);return
+    if not plat:safe_send_message(cid,"Error: Platform not set.Start again.",reply_markup=get_main_keyboard(cid));user_states.pop(cid,None);return
     if not is_valid_base32(s_in):safe_send_message(cid,"❌*Invalid Secret*(A-Z,2-7).\nTry again,'⬅️ Back'.",reply_markup=get_back_keyboard("2fa_secret_entry"));return
     cl,p=s_in.replace(" ","").replace("-","").upper(),"";p="="*(-len(cl)%8);final_s=cl+p
     if cid not in user_2fa_secrets:user_2fa_secrets[cid]={}
@@ -570,7 +606,7 @@ def echo_all(m):
     if is_bot_blocked(cid): safe_delete_user(cid); return
     if not (cid in approved_users or is_admin(cid)): (safe_send_message(cid,"⏳Access pending.") if cid in pending_approvals else send_welcome(m)); return
     st_info=user_states.get(cid,{});st=st_info.get("state")
-    backs=["⬅️ Back to 2FA Platforms","⬅️ Back to Main","⬅️ Back to User Management","⬅️ Back to Broadcast Menu","⬅️ Back to Admin"] # Common back buttons
+    backs=["⬅️ Back to 2FA Platforms","⬅️ Back to Main","⬅️ Back to User Management","⬅️ Back to Broadcast Menu","⬅️ Back to Admin"]
     if st==STATE_WAITING_FOR_2FA_SECRET and m.text not in backs: 
         safe_send_message(cid,f"Waiting for 2FA secret for {st_info.get('platform','platform')} or use 'Back'.",reply_markup=get_back_keyboard("2fa_secret_entry")); return
     safe_send_message(cid,f"🤔Unknown:'{m.text}'.Use buttons.",reply_markup=get_main_keyboard(cid))
@@ -586,14 +622,13 @@ if __name__ == '__main__':
         print(f"[{datetime.datetime.now()}] Main: Background threads initiated.")
     except Exception as e_thread_start:
         print(f"[{datetime.datetime.now()}] CRITICAL ERROR: Failed to start background threads: {e_thread_start}")
-        # Depending on deployment, this might be a reason to exit or log heavily.
     
-    print(f"[{datetime.datetime.now()}] Main: Starting polling for bot token: ...{BOT_TOKEN[-6:] if BOT_TOKEN and len(BOT_TOKEN)>5 else 'TOKEN_TOO_SHORT_OR_NONE'}")
+    print(f"[{datetime.datetime.now()}] Main: Starting polling for bot token: ...{BOT_TOKEN[-6:] if BOT_TOKEN and len(BOT_TOKEN)>5 else 'TOKEN_INVALID_OR_SHORT'}")
     
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30, logger_level=None, none_stop=True) # none_stop=True to continue on errors
-            print(f"[{datetime.datetime.now()}] Warning: infinity_polling loop has exited, which is unexpected. Restarting...") # Should not happen with none_stop=True
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, logger_level=None, none_stop=True)
+            print(f"[{datetime.datetime.now()}] Warning: infinity_polling loop has exited. Restarting...") # Should not happen with none_stop
         except requests.exceptions.ReadTimeout as e_rt:
             print(f"[{datetime.datetime.now()}] Polling ReadTimeout: {e_rt}. Retrying in 15s...")
             time.sleep(15)
@@ -605,9 +640,10 @@ if __name__ == '__main__':
             time.sleep(60)
         except Exception as main_loop_e:
             print(f"[{datetime.datetime.now()}] CRITICAL ERROR in main polling loop: {type(main_loop_e).__name__} - {main_loop_e}")
-            print(f"[{datetime.datetime.now()}] Full traceback: {main_loop_e.__traceback__}") # Log traceback for crashes
+            import traceback
+            traceback.print_exc() # Print full traceback for crash diagnosis
             print(f"[{datetime.datetime.now()}] Retrying polling in 60 seconds...")
             time.sleep(60)
         else: 
-            print(f"[{datetime.datetime.now()}] Polling loop exited cleanly (should be rare with infinity_polling and none_stop). Restarting in 10s...")
+            print(f"[{datetime.datetime.now()}] Polling loop exited cleanly (unexpected). Restarting in 10s...")
             time.sleep(10)
