@@ -431,26 +431,25 @@ def back_to_admin(m): safe_send_message(m.chat.id,"⬅️To admin",reply_markup=
 def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main",reply_markup=get_main_keyboard(m.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_','reject_')))
-def handle_approval(c): # Corrected syntax error location
+def handle_approval(c):
     if not is_admin(c.message.chat.id): bot.answer_callback_query(c.id,"❌Not allowed."); return
     try: act,uid_s=c.data.split('_'); uid=int(uid_s)
     except: bot.answer_callback_query(c.id,"Err."); bot.edit_message_text("Err.",c.message.chat.id,c.message.message_id); return
     
-    info=pending_approvals.get(uid) # Get info from pending_approvals first
-    if not info and uid in user_profiles : # Fallback to user_profiles if not in pending (e.g. re-approving)
+    info=pending_approvals.get(uid) 
+    if not info and uid in user_profiles : 
         info = user_profiles.get(uid)
-    
     n=info.get('name',str(uid)) if info else str(uid)
 
     if act=="approve":
         if uid in pending_approvals or uid not in approved_users: 
             approved_users.add(uid)
-            # Only assign to user_profiles if info exists and user not already in user_profiles
-            # This was the location of the syntax error (line 494 of previous full code)
-            if uid not in user_profiles and info: # Corrected assignment
-                user_profiles[uid] = info 
-            elif info and uid in user_profiles: # Update if already exists and new info available
-                 user_profiles[uid].update(info)
+            # **FIXED SYNTAX ERROR HERE**
+            if info: # Only try to access/update user_profiles if info is not None
+                if uid not in user_profiles:
+                    user_profiles[uid] = info 
+                else: 
+                    user_profiles[uid].update(info) # Update if exists
 
             pending_approvals.pop(uid,None)
             safe_send_message(uid,"✅Access approved!",reply_markup=get_main_keyboard(uid))
