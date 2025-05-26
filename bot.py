@@ -33,7 +33,7 @@ if not BOT_TOKEN:
 if not ADMIN_ID:
     print(f"[{datetime.datetime.now()}] WARNING: ADMIN_ID not set. Admin features might not work as expected.")
 
-print(f"[{datetime.datetime.now()}] BOT_TOKEN loaded: ...{BOT_TOKEN[-6:] if BOT_TOKEN else 'NONE'}")
+print(f"[{datetime.datetime.now()}] BOT_TOKEN loaded: ...{BOT_TOKEN[-6:] if BOT_TOKEN and len(BOT_TOKEN) > 5 else 'TOKEN_INVALID_OR_SHORT'}")
 print(f"[{datetime.datetime.now()}] ADMIN_ID loaded: {ADMIN_ID if ADMIN_ID else 'NOT SET'}")
 
 try:
@@ -46,7 +46,7 @@ except Exception as e_telebot:
 # --- API Configuration for mail.tm and Retry Settings ---
 MAIL_TM_API_BASE_URL = "https://api.mail.tm"
 MAX_RETRIES = 3
-RETRY_DELAY = 3
+RETRY_DELAY = 3 
 REQUESTS_TIMEOUT = 15
 
 HTTP_HEADERS = { 
@@ -56,13 +56,13 @@ HTTP_HEADERS = {
 }
 
 # Data storage
-user_data = {} 
-last_message_ids = {}
+user_data = {} # For mail.tm: {"email": ..., "password": ..., "token": ..., "id": accountIdFromMailTm}
+last_message_ids = {} 
 active_sessions = set()
 pending_approvals = {}
 approved_users = set()
 user_profiles = {}
-user_2fa_secrets = {}
+user_2fa_secrets = {} 
 
 # --- Helper Functions ---
 def is_admin(chat_id): 
@@ -73,7 +73,7 @@ def safe_delete_user(chat_id):
     try:
         user_data.pop(chat_id, None)
         last_message_ids.pop(chat_id, None)
-        user_2fa_secrets.pop(chat_id, None)
+        user_2fa_secrets.pop(chat_id, None) # Changed from user_2fa_codes
         active_sessions.discard(chat_id)
         pending_approvals.pop(chat_id, None)
         approved_users.discard(chat_id)
@@ -86,8 +86,15 @@ def is_bot_blocked(chat_id):
         bot.get_chat(chat_id)
         return False
     except telebot.apihelper.ApiTelegramException as e:
-        return hasattr(e, 'result_json') and e.result_json.get("error_code") == 403 and \
-               "bot was blocked" in e.result_json.get("description", "")
+        # Updated to check result_json as per pyTelegramBotAPI v4.x.x+
+        if hasattr(e, 'result_json') and e.result_json and isinstance(e.result_json, dict) and \
+           e.result_json.get("error_code") == 403 and "bot was blocked" in e.result_json.get("description", ""):
+            return True
+        # Fallback for older or different error structures if result is not a dict
+        elif hasattr(e, 'result') and hasattr(e.result, 'status_code') and e.result.status_code == 403 and \
+             hasattr(e.result, 'text') and "bot was blocked" in e.result.text:
+            return True
+        return False
     except Exception as e_block_check:
         print(f"[{datetime.datetime.now()}] Error checking if bot is blocked for {chat_id}: {e_block_check}")
         return False
@@ -100,8 +107,10 @@ def get_user_info(user):
 # --- Keyboards ---
 def get_main_keyboard(chat_id):
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add("📬 New mail", "🔄 Refresh Mail", "👨 Male Profile", "👩 Female Profile", "🔐 2FA Auth", "👤 My Account")
-    if is_admin(chat_id): kb.add("👑 Admin Panel")
+    kb.add(telebot.types.KeyboardButton("📬 New mail"), telebot.types.KeyboardButton("🔄 Refresh")) # "Refresh" is the mail refresh button
+    kb.add(telebot.types.KeyboardButton("👨 Male Profile"), telebot.types.KeyboardButton("👩 Female Profile"))
+    kb.add(telebot.types.KeyboardButton("🔐 2FA Auth"), telebot.types.KeyboardButton("👤 My Account"))
+    if is_admin(chat_id): kb.add(telebot.types.KeyboardButton("👑 Admin Panel"))
     return kb
 def get_admin_keyboard():
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -118,18 +127,19 @@ def get_approval_keyboard(user_id):
     return kb
 def get_user_account_keyboard():
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add("📧 My Current Email", "🆔 My Info", "⬅️ Back to Main")
+    kb.add("📧 My Email", "🆔 My Info", "⬅️ Back to Main") # "My Email" will show the current mail.tm email
     return kb
 def get_2fa_platform_keyboard():
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add("Google", "Facebook", "Instagram", "Twitter", "Microsoft", "Apple", "⬅️ Back to Main")
     return kb
-def get_back_keyboard(target="main"):
+def get_back_keyboard(target="main"): # Modified this to return a more generic "Back" or specific ones
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     if target=="admin_user_management": kb.row("⬅️ Back to User Management")
     elif target=="admin_broadcast": kb.row("⬅️ Back to Broadcast Menu")
     elif target=="2fa_secret_entry": kb.row("⬅️ Back to 2FA Platforms")
-    else: kb.row("⬅️ Back to Main")
+    elif target=="generic_back": kb.row("⬅️ Back") # Generic back button
+    else: kb.row("⬅️ Back to Main") # Default
     return kb
 def get_broadcast_keyboard():
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -143,7 +153,8 @@ def safe_send_message(chat_id, text, **kwargs):
         msg = bot.send_message(chat_id, text, **kwargs)
         active_sessions.add(chat_id); return msg
     except telebot.apihelper.ApiTelegramException as e:
-        if hasattr(e, 'result_json') and e.result_json.get("error_code")==403 and "bot was blocked" in e.result_json.get("description",""):
+        if hasattr(e, 'result_json') and e.result_json and isinstance(e.result_json, dict) and \
+           e.result_json.get("error_code")==403 and "bot was blocked" in e.result_json.get("description",""):
             safe_delete_user(chat_id)
         elif hasattr(e, 'result_json'): print(f"[{datetime.datetime.now()}] Msg Err to {chat_id}: API {e.result_json}")
         else: print(f"[{datetime.datetime.now()}] Msg Err to {chat_id}: API {str(e)}")
@@ -151,7 +162,7 @@ def safe_send_message(chat_id, text, **kwargs):
     except Exception as e: print(f"[{datetime.datetime.now()}] Generic Msg Err to {chat_id}: {type(e).__name__} - {e}"); return None
 
 # --- mail.tm API Functions ---
-def get_mail_tm_domains():
+def get_mail_tm_domains(): # Renamed from get_domain
     url = f"{MAIL_TM_API_BASE_URL}/domains"
     for attempt in range(MAX_RETRIES):
         try:
@@ -159,21 +170,26 @@ def get_mail_tm_domains():
             res.raise_for_status(); data = res.json()
             if data and isinstance(data.get('hydra:member'), list) and data['hydra:member']:
                 return [d['domain'] for d in data['hydra:member'] if 'domain' in d]
-            return None
+            return None # No domains found
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
             else: print(f"[{datetime.datetime.now()}] Net err mail.tm domains: {e}"); return None
         except (ValueError, KeyError) as e: print(f"[{datetime.datetime.now()}] JSON/Key err mail.tm domains: {e}"); return None
     return None
 
-def create_mail_tm_account(address, password):
+def generate_mail_tm_email(domain): # Renamed from generate_email
+    name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    return f"{name}@{domain}" # Only returns email string, not name part
+
+def create_mail_tm_account(address, password): # Renamed from create_account
     url = f"{MAIL_TM_API_BASE_URL}/accounts"; payload = {"address": address, "password": password}
     for attempt in range(MAX_RETRIES):
         try:
             res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            # print(f"DEBUG create_mail_tm_account status: {res.status_code}, response: {res.text[:200]}")
             if res.status_code == 201: return "CREATED", res.json()
-            if res.status_code == 400: return "EXISTS_OR_BAD_REQUEST", res.json().get('hydra:description', 'Bad request/addr exists.')
             if res.status_code == 422: return "EXISTS", res.json().get('hydra:description', 'Address likely exists.')
+            if res.status_code == 400: return "EXISTS_OR_BAD_REQUEST", res.json().get('hydra:description', 'Bad request/addr exists.')
             res.raise_for_status(); return "ERROR", "Unknown resp create mail.tm acc."
         except requests.exceptions.HTTPError as e:
             if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
@@ -184,11 +200,14 @@ def create_mail_tm_account(address, password):
         except ValueError: return "JSON_ERROR", "Invalid JSON create mail.tm acc."
     return "API_ERROR", "Failed create mail.tm acc after retries."
 
-def get_mail_tm_token(address, password):
+def get_mail_tm_token(address, password): # Renamed from get_token
     url = f"{MAIL_TM_API_BASE_URL}/token"; payload = {"address": address, "password": password}
+    # print(f"DEBUG get_mail_tm_token for: {address}")
+    time.sleep(1.5) # mail.tm sometimes needs a slight delay after account creation
     for attempt in range(MAX_RETRIES):
         try:
             res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            # print(f"DEBUG get_mail_tm_token status: {res.status_code}, response: {res.text[:200]}")
             res.raise_for_status(); data = res.json()
             if data and data.get('token') and data.get('id'): return "SUCCESS", data
             return "API_ERROR", "Token/ID not in mail.tm resp."
@@ -220,8 +239,8 @@ def get_mail_tm_messages(token):
         except ValueError: return "JSON_ERROR", "Invalid JSON mail.tm msgs."
     return "API_ERROR", "Failed get mail.tm msgs after retries."
 
-def get_mail_tm_message_detail(token, message_id_path):
-    url = f"{MAIL_TM_API_BASE_URL}{message_id_path}"; auth_headers = {**HTTP_HEADERS, 'Authorization': f'Bearer {token}'}
+def get_mail_tm_message_detail(token, message_api_id): # message_api_id is the full path like /messages/uuid
+    url = f"{MAIL_TM_API_BASE_URL}{message_api_id}"; auth_headers = {**HTTP_HEADERS, 'Authorization': f'Bearer {token}'}
     for attempt in range(MAX_RETRIES):
         try:
             res = requests.get(url, headers=auth_headers, timeout=REQUESTS_TIMEOUT)
@@ -239,12 +258,12 @@ def get_mail_tm_message_detail(token, message_id_path):
     return "API_ERROR", "Failed get mail.tm detail after retries."
 
 # --- Profile Generator ---
-def generate_username(): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
-def generate_password(): return ''.join(random.choices(string.ascii_letters+string.digits,k=12))
+def generate_username_profile(): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=10)) # Renamed to avoid conflict
+def generate_password_profile(): return ''.join(random.choices(string.ascii_letters+string.digits,k=8)) + datetime.datetime.now().strftime("%d%m") # Slightly more unique
 def generate_us_phone(): return f"1{random.randint(200,999)}{''.join([str(random.randint(0,9)) for _ in range(7)])}"
 def generate_profile(gender):
     name = fake.name_male() if gender=="male" else fake.name_female()
-    return gender, name, generate_username(), generate_password(), generate_us_phone()
+    return gender, name, generate_username_profile(), generate_password_profile(), generate_us_phone()
 def profile_message(g,n,u,p,ph):
     return (f"🔐*Generated Profile*\n\n{'👨' if g=='male' else '👩'}*Gender:* {g.capitalize()}\n"
             f"🧑‍💼*Name:* `{n}`\n🆔*Username:* `{u}`\n🔑*Password:* `{p}`\n📞*Phone:* `{ph}`\n\n✅Tap to copy")
@@ -295,17 +314,19 @@ def auto_refresh_worker():
                 if list_status == "EMPTY" or not messages_summary: continue
 
                 seen_ids = last_message_ids.setdefault(chat_id, set())
-                for msg_summary in messages_summary[:5]: 
-                    msg_id_path = msg_summary.get('id'); unique_id = msg_summary.get('@id', msg_id_path)
-                    if not msg_id_path or unique_id in seen_ids: continue
-                    detail_status, detail_data = get_mail_tm_message_detail(token, msg_id_path)
+                for msg_summary in messages_summary[:5]: # mail.tm returns newest first
+                    msg_api_id = msg_summary.get('id') # This is the API path like /messages/uuid
+                    unique_id = msg_summary.get('@id', msg_api_id) # Use @id if available
+                    if not msg_api_id or unique_id in seen_ids: continue
+                    
+                    detail_status, detail_data = get_mail_tm_message_detail(token, msg_api_id)
                     if detail_status == "SUCCESS":
                         if safe_send_message(chat_id, format_mail_tm_message(detail_data)): seen_ids.add(unique_id)
                         time.sleep(0.7)
                     elif detail_status == "AUTH_ERROR":
                         print(f"[{datetime.datetime.now()}] Auto-refresh: Auth err detail {chat_id}. Clearing."); user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
                         safe_send_message(chat_id, "⚠️ Mail.tm session invalid (detail). Use '📬 New mail'."); break 
-                    else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_id_path} ({chat_id}): {detail_status}-{detail_data}")
+                    else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_api_id} ({chat_id}): {detail_status}-{detail_data}")
                 if len(seen_ids)>150: oldest=random.sample(list(seen_ids), len(seen_ids)-75) if len(seen_ids)>75 else []; [seen_ids.discard(oid) for oid in oldest]
         except Exception as e: print(f"[{datetime.datetime.now()}] Error in auto_refresh_worker: {type(e).__name__} - {e}")
         time.sleep(30)
@@ -431,7 +452,7 @@ def back_to_admin(m): safe_send_message(m.chat.id,"⬅️To admin",reply_markup=
 def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main",reply_markup=get_main_keyboard(m.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_','reject_')))
-def handle_approval(c):
+def handle_approval(c): # **Syntax Error was here, now corrected**
     if not is_admin(c.message.chat.id): bot.answer_callback_query(c.id,"❌Not allowed."); return
     try: act,uid_s=c.data.split('_'); uid=int(uid_s)
     except: bot.answer_callback_query(c.id,"Err."); bot.edit_message_text("Err.",c.message.chat.id,c.message.message_id); return
@@ -444,12 +465,11 @@ def handle_approval(c):
     if act=="approve":
         if uid in pending_approvals or uid not in approved_users: 
             approved_users.add(uid)
-            # **FIXED SYNTAX ERROR HERE**
-            if info: # Only try to access/update user_profiles if info is not None
-                if uid not in user_profiles:
+            if info: # Only process 'info' if it's not None
+                if uid not in user_profiles: # If user profile doesn't exist, create it
                     user_profiles[uid] = info 
-                else: 
-                    user_profiles[uid].update(info) # Update if exists
+                else: # If user profile exists, update it with new info (if any)
+                    user_profiles[uid].update(info)
 
             pending_approvals.pop(uid,None)
             safe_send_message(uid,"✅Access approved!",reply_markup=get_main_keyboard(uid))
@@ -465,7 +485,7 @@ def handle_approval(c):
 
 # --- Mail Handlers (mail.tm) ---
 @bot.message_handler(func=lambda msg: msg.text == "📬 New mail")
-def new_mail_mail_tm(message):
+def new_mail(message): # Reverted to original new_mail for mail.tm
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)): safe_send_message(chat_id, "⏳ Access pending."); return
@@ -480,9 +500,8 @@ def new_mail_mail_tm(message):
         return
     
     domain = random.choice(domains)
-    local_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    email_address = f"{local_part}@{domain}"
-    password = generate_password()
+    email_address = generate_mail_tm_email(domain) # Use the renamed function
+    password = generate_password_profile() # Use specific password generator for profiles/email accounts
 
     status_create, acc_data = create_mail_tm_account(email_address, password)
 
@@ -498,15 +517,15 @@ def new_mail_mail_tm(message):
             "id": token_data["id"], "account_id_short": token_data["id"].split('/')[-1] if token_data.get("id") else "N/A"
         }
         last_message_ids[chat_id] = set() 
-        msg_txt = f"✅ *New Email (mail.tm):*\n`{email_address}`\n\nTap to copy. Use 'Refresh Mail'."
+        msg_txt = f"✅ *New Email (mail.tm):*\n`{email_address}`\n\nTap to copy. Use 'Refresh' button."
         if gen_msg: bot.edit_message_text(msg_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, msg_txt)
     else:
         error_txt = f"❌ Failed to get token for mail.tm account `{email_address}`: {token_data}. Service issue or account conflict."
         if gen_msg: bot.edit_message_text(error_txt, chat_id, gen_msg.message_id, parse_mode="Markdown"); else: safe_send_message(chat_id, error_txt)
 
-@bot.message_handler(func=lambda msg: msg.text == "🔄 Refresh Mail")
-def refresh_mail_mail_tm(message):
+@bot.message_handler(func=lambda msg: msg.text == "🔄 Refresh") # Original button name for mail.tm
+def refresh_mail(message): # Reverted to original refresh_mail for mail.tm
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)): safe_send_message(chat_id, "⏳ Access pending."); return
@@ -533,9 +552,9 @@ def refresh_mail_mail_tm(message):
         except: pass 
     seen_ids, new_count = last_message_ids.setdefault(chat_id, set()), 0
     for msg_summary in messages_summary[:10]: 
-        msg_id_path = msg_summary.get('id'); unique_identifier = msg_summary.get('@id', msg_id_path)
-        if not msg_id_path or unique_identifier in seen_ids: continue
-        detail_status, detail_data = get_mail_tm_message_detail(token, msg_id_path)
+        msg_api_id = msg_summary.get('id'); unique_identifier = msg_summary.get('@id', msg_api_id)
+        if not msg_api_id or unique_identifier in seen_ids: continue
+        detail_status, detail_data = get_mail_tm_message_detail(token, msg_api_id)
         if detail_status == "SUCCESS":
             new_count +=1
             if safe_send_message(chat_id, format_mail_tm_message(detail_data)): seen_ids.add(unique_identifier)
@@ -543,11 +562,11 @@ def refresh_mail_mail_tm(message):
         elif detail_status == "AUTH_ERROR":
             user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
             safe_send_message(chat_id, "⚠️ Mail.tm token invalid fetching details. Use '📬 New mail'."); break
-        else: safe_send_message(chat_id, f"⚠️ Error fetching detail for msg ({msg_id_path}): {detail_data}")
+        else: safe_send_message(chat_id, f"⚠️ Error fetching detail for msg ({msg_api_id}): {detail_data}")
     if new_count == 0: safe_send_message(chat_id, f"✅ No *new* messages in `{email_addr}` since last check.")
     else: safe_send_message(chat_id, f"✨ Found {new_count} new message(s) for `{email_addr}`.")
 
-# --- Profile & Account Handlers ---
+# --- Profile & Account ---
 @bot.message_handler(func=lambda m:m.text in ["👨 Male Profile","👩 Female Profile"])
 def gen_profile_h(m):
     cid=m.chat.id; 
@@ -560,7 +579,7 @@ def my_acc_info(m):
     if is_bot_blocked(cid): return
     if not (cid in approved_users or is_admin(cid)): safe_send_message(cid,"⏳Access pending."); return
     safe_send_message(cid,"👤Account Options:",reply_markup=get_user_account_keyboard())
-@bot.message_handler(func=lambda m:m.text=="📧 My Current Email")
+@bot.message_handler(func=lambda m:m.text=="📧 My Email")
 def show_my_email(m):
     cid=m.chat.id;
     if is_bot_blocked(cid): return
@@ -615,9 +634,13 @@ def echo_all(m):
     if is_bot_blocked(cid): safe_delete_user(cid); return
     if not (cid in approved_users or is_admin(cid)): (safe_send_message(cid,"⏳Access pending.") if cid in pending_approvals else send_welcome(m)); return
     st_info=user_states.get(cid,{});st=st_info.get("state")
-    backs=["⬅️ Back to 2FA Platforms","⬅️ Back to Main","⬅️ Back to User Management","⬅️ Back to Broadcast Menu","⬅️ Back to Admin"]
+    backs=["⬅️ Back to 2FA Platforms","⬅️ Back to Main","⬅️ Back to User Management","⬅️ Back to Broadcast Menu","⬅️ Back to Admin", "⬅️ Back"] # Added generic "⬅️ Back"
     if st==STATE_WAITING_FOR_2FA_SECRET and m.text not in backs: 
-        safe_send_message(cid,f"Waiting for 2FA secret for {st_info.get('platform','platform')} or use 'Back'.",reply_markup=get_back_keyboard("2fa_secret_entry")); return
+        safe_send_message(cid,f"Waiting for 2FA secret for {st_info.get('platform','platform')} or use 'Back'.",reply_markup=get_back_keyboard("2fa_secret_entry")); return # Use specific back keyboard
+    # Check if a generic back button was pressed from a next_step_handler context where user_states might not be set
+    if m.text == "⬅️ Back": # Handle generic back if no specific state matches
+        safe_send_message(cid,"⬅️ Operation cancelled or going back...", reply_markup=get_main_keyboard(cid)) # Default to main menu
+        return
     safe_send_message(cid,f"🤔Unknown:'{m.text}'.Use buttons.",reply_markup=get_main_keyboard(cid))
 
 # --- Main Loop ---
