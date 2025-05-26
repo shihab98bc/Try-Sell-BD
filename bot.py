@@ -55,6 +55,11 @@ HTTP_HEADERS = {
     'Content-Type': 'application/json'
 }
 
+# --- Domain Caching ---
+MAIL_TM_DOMAIN_CACHE = None
+MAIL_TM_DOMAIN_CACHE_EXPIRY = None
+MAIL_TM_DOMAIN_CACHE_DURATION = 3600  # Cache domains for 1 hour (in seconds)
+
 # Data storage
 user_data = {} 
 last_message_ids = {}
@@ -159,22 +164,35 @@ def safe_send_message(chat_id, text, **kwargs):
         return None
     except Exception as e: print(f"[{datetime.datetime.now()}] Generic Msg Err to {chat_id}: {type(e).__name__} - {e}"); return None
 
-# --- mail.tm API Functions ---
-def get_mail_tm_domains():
+# --- mail.tm API Functions (with Domain Caching) ---
+def get_mail_tm_domains(): 
+    global MAIL_TM_DOMAIN_CACHE, MAIL_TM_DOMAIN_CACHE_EXPIRY
+    now = time.time()
+
+    if MAIL_TM_DOMAIN_CACHE and MAIL_TM_DOMAIN_CACHE_EXPIRY and now < MAIL_TM_DOMAIN_CACHE_EXPIRY:
+        # print(f"[{datetime.datetime.now()}] Using cached mail.tm domains.")
+        return MAIL_TM_DOMAIN_CACHE
+
     url = f"{MAIL_TM_API_BASE_URL}/domains"
+    # print(f"[{datetime.datetime.now()}] Fetching mail.tm domains from API...")
     for attempt in range(MAX_RETRIES):
         try:
             res = requests.get(url, params={'page': 1}, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
             res.raise_for_status(); data = res.json()
             if data and isinstance(data.get('hydra:member'), list) and data['hydra:member']:
-                return [d['domain'] for d in data['hydra:member'] if 'domain' in d]
-            print(f"[{datetime.datetime.now()}] mail.tm: No domains found in response or malformed: {data}")
-            return None
+                fetched_domains = [d['domain'] for d in data['hydra:member'] if 'domain' in d]
+                if fetched_domains:
+                    MAIL_TM_DOMAIN_CACHE = fetched_domains
+                    MAIL_TM_DOMAIN_CACHE_EXPIRY = now + MAIL_TM_DOMAIN_CACHE_DURATION
+                    # print(f"[{datetime.datetime.now()}] mail.tm domains cached successfully.")
+                    return fetched_domains
+            print(f"[{datetime.datetime.now()}] mail.tm: No domains found or malformed response: {data}")
+            return None # Explicitly return None on failure to fetch new domains
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
-            else: print(f"[{datetime.datetime.now()}] Net err fetching mail.tm domains: {e}"); return None
-        except (ValueError, KeyError) as e: print(f"[{datetime.datetime.now()}] JSON/Key err mail.tm domains: {e}"); return None
-    return None
+            else: print(f"[{datetime.datetime.now()}] Net err fetching mail.tm domains after retries: {e}"); 
+        except (ValueError, KeyError) as e: print(f"[{datetime.datetime.now()}] JSON/Key err mail.tm domains: {e}"); 
+    return None # Return None if all retries fail or other errors occur
 
 def generate_mail_tm_email(domain): 
     name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
@@ -186,12 +204,7 @@ def create_mail_tm_account(address, password):
         try:
             res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
             if res.status_code == 201: return "CREATED", res.json()
-            if res.status_code == 422: # Unprocessable Entity (e.g., address already used)
-                error_detail = res.json().get('hydra:description', 'Address likely already exists.')
-                violations = res.json().get('violations')
-                if violations and isinstance(violations, list) and violations[0].get('message'):
-                    error_detail = violations[0]['message']
-                return "EXISTS", error_detail
+            if res.status_code == 422: return "EXISTS", res.json().get('hydra:description', 'Address likely exists.')
             if res.status_code == 400: return "BAD_REQUEST", res.json().get('hydra:description', 'Bad request for account creation.')
             res.raise_for_status(); return "ERROR", "Unknown resp create mail.tm acc."
         except requests.exceptions.HTTPError as e:
@@ -205,7 +218,7 @@ def create_mail_tm_account(address, password):
 
 def get_mail_tm_token(address, password): 
     url = f"{MAIL_TM_API_BASE_URL}/token"; payload = {"address": address, "password": password}
-    time.sleep(1.5) 
+    time.sleep(0.5) # Reduced sleep time
     for attempt in range(MAX_RETRIES):
         try:
             res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
@@ -321,14 +334,14 @@ def auto_refresh_worker():
                     detail_status, detail_data = get_mail_tm_message_detail(token, msg_api_id)
                     if detail_status == "SUCCESS":
                         if safe_send_message(chat_id, format_mail_tm_message(detail_data)): seen_ids.add(unique_id)
-                        time.sleep(0.7)
+                        time.sleep(0.7) # Increased slightly from 0.5 for a bit more spacing
                     elif detail_status == "AUTH_ERROR":
                         print(f"[{datetime.datetime.now()}] Auto-refresh: Auth err detail {chat_id}. Clearing."); user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
                         safe_send_message(chat_id, "⚠️ Mail.tm session invalid (detail). Use '📬 New mail'."); break 
                     else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_api_id} ({chat_id}): {detail_status}-{detail_data}")
                 if len(seen_ids)>150: oldest=random.sample(list(seen_ids), len(seen_ids)-75) if len(seen_ids)>75 else []; [seen_ids.discard(oid) for oid in oldest]
         except Exception as e: print(f"[{datetime.datetime.now()}] Error in auto_refresh_worker: {type(e).__name__} - {e}")
-        time.sleep(30)
+        time.sleep(25) # Slightly reduced from 30 for potentially faster background checks
 
 def cleanup_blocked_users():
     print(f"[{datetime.datetime.now()}] Cleanup_blocked_users worker started.")
@@ -340,8 +353,7 @@ def cleanup_blocked_users():
         time.sleep(3600) 
 
 # --- Bot Handlers ---
-# ... (Welcome, Admin, Profile, Account, 2FA handlers are the same as the previous correct version, 
-#      only Mail Handlers below are specifically for mail.tm) ...
+# (Welcome, Admin, Profile, Account, 2FA handlers are the same as the previous correct version)
 
 @bot.message_handler(commands=['start','help'])
 def send_welcome(m):
