@@ -43,9 +43,8 @@ except Exception as e_telebot:
     print(f"[{datetime.datetime.now()}] CRITICAL ERROR: Failed to create TeleBot instance: {e_telebot}. Exiting.")
     raise
 
-# --- API Configuration for temp-mail.org style API and Retry Settings ---
-TEMP_MAIL_ORG_API_BASE_URL = "https://api.temp-mail.org/request" # Common base for this type
-DEFAULT_FALLBACK_DOMAIN = "kumailone.com" # A common domain often seen with these services
+# --- API Configuration for mail.tm and Retry Settings ---
+MAIL_TM_API_BASE_URL = "https://api.mail.tm"
 MAX_RETRIES = 3
 RETRY_DELAY = 3 
 REQUESTS_TIMEOUT = 15
@@ -53,11 +52,12 @@ REQUESTS_TIMEOUT = 15
 HTTP_HEADERS = { 
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
     'Accept': 'application/json', 
+    'Content-Type': 'application/json'
 }
 
 # Data storage
-user_data = {} # For temp-mail.org style: {"email": "user@tempdomain.com"}
-last_message_ids = {} 
+user_data = {} 
+last_message_ids = {}
 active_sessions = set()
 pending_approvals = {}
 approved_users = set()
@@ -159,65 +159,108 @@ def safe_send_message(chat_id, text, **kwargs):
         return None
     except Exception as e: print(f"[{datetime.datetime.now()}] Generic Msg Err to {chat_id}: {type(e).__name__} - {e}"); return None
 
-# --- temp-mail.org Style API Functions ---
-def get_temp_mail_org_domains():
-    url = f"{TEMP_MAIL_ORG_API_BASE_URL}/domains/format/json/"
+# --- mail.tm API Functions ---
+def get_mail_tm_domains():
+    url = f"{MAIL_TM_API_BASE_URL}/domains"
     for attempt in range(MAX_RETRIES):
         try:
-            res = requests.get(url, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            res = requests.get(url, params={'page': 1}, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
             res.raise_for_status(); data = res.json()
-            if data and isinstance(data, list) and data: # Expects a list of strings
-                # Domains from API often start with '.', remove it
-                return [d.lstrip('.') for d in data if isinstance(d, str) and d.startswith('.')]
+            if data and isinstance(data.get('hydra:member'), list) and data['hydra:member']:
+                return [d['domain'] for d in data['hydra:member'] if 'domain' in d]
+            print(f"[{datetime.datetime.now()}] mail.tm: No domains found in response or malformed: {data}")
             return None
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1: time.sleep(RETRY_DELAY * (attempt + 1))
-            else: print(f"[{datetime.datetime.now()}] Net err temp-mail.org domains: {e}"); return None
-        except ValueError: print(f"[{datetime.datetime.now()}] JSON err temp-mail.org domains"); return None
+            else: print(f"[{datetime.datetime.now()}] Net err fetching mail.tm domains: {e}"); return None
+        except (ValueError, KeyError) as e: print(f"[{datetime.datetime.now()}] JSON/Key err mail.tm domains: {e}"); return None
     return None
 
-def generate_temp_mail_org_address():
-    name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    domains = get_temp_mail_org_domains()
-    domain_to_use = DEFAULT_FALLBACK_DOMAIN
-    if domains and isinstance(domains, list) and domains:
-        domain_to_use = random.choice(domains)
-    
-    email_address = f"{name}@{domain_to_use}"
-    # This API style doesn't usually require account creation.
-    # The existence of the email is implicit for fetching.
-    return "SUCCESS", {"email": email_address}
+def generate_mail_tm_email(domain): 
+    name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    return f"{name}@{domain}" 
 
-
-def fetch_temp_mail_org_messages(email_address):
-    if not email_address or '@' not in email_address:
-        return "API_ERROR", "Invalid email address format."
-    
-    email_hash = hashlib.md5(email_address.encode('utf-8')).hexdigest()
-    url = f"{TEMP_MAIL_ORG_API_BASE_URL}/mail/id/{email_hash}/format/json/"
-    
+def create_mail_tm_account(address, password): 
+    url = f"{MAIL_TM_API_BASE_URL}/accounts"; payload = {"address": address, "password": password}
     for attempt in range(MAX_RETRIES):
         try:
-            res = requests.get(url, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
-            res.raise_for_status(); data = res.json()
-            if isinstance(data, list): # Success usually returns a list of message objects
-                return "EMPTY" if not data else "SUCCESS", data
-            elif isinstance(data, dict) and "error" in data: # API specific error
-                if data["error"] == "no_mail": return "EMPTY", []
-                return "API_ERROR", data["error"]
-            return "API_ERROR", "Unexp resp temp-mail.org msg list."
+            res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            if res.status_code == 201: return "CREATED", res.json()
+            if res.status_code == 422: # Unprocessable Entity (e.g., address already used)
+                error_detail = res.json().get('hydra:description', 'Address likely already exists.')
+                violations = res.json().get('violations')
+                if violations and isinstance(violations, list) and violations[0].get('message'):
+                    error_detail = violations[0]['message']
+                return "EXISTS", error_detail
+            if res.status_code == 400: return "BAD_REQUEST", res.json().get('hydra:description', 'Bad request for account creation.')
+            res.raise_for_status(); return "ERROR", "Unknown resp create mail.tm acc."
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code in [500,502,503,504,403] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue # Added 403
-            return "API_ERROR", f"temp-mail.org HTTP {e.response.status_code} for list."
+            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} create mail.tm acc: {e.response.text[:200]}"
         except requests.exceptions.RequestException as e:
             if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
-            else: return "NETWORK_ERROR", f"Net err temp-mail.org list after {MAX_RETRIES} attempts."
-        except ValueError: return "JSON_ERROR", "Invalid JSON temp-mail.org msg list."
-    return "API_ERROR", "Failed temp-mail.org msg list after retries."
+            else: return "NETWORK_ERROR", f"Net err create mail.tm acc after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON create mail.tm acc."
+    return "API_ERROR", "Failed create mail.tm acc after retries."
+
+def get_mail_tm_token(address, password): 
+    url = f"{MAIL_TM_API_BASE_URL}/token"; payload = {"address": address, "password": password}
+    time.sleep(1.5) 
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=REQUESTS_TIMEOUT)
+            res.raise_for_status(); data = res.json()
+            if data and data.get('token') and data.get('id'): return "SUCCESS", data
+            return "API_ERROR", f"Token/ID not in mail.tm resp: {data}"
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} get mail.tm token: {e.response.text[:200]}"
+        except requests.exceptions.RequestException as e:
+            if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
+            else: return "NETWORK_ERROR", f"Net err get mail.tm token after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON get mail.tm token."
+    return "API_ERROR", "Failed get mail.tm token after retries."
+
+def get_mail_tm_messages(token):
+    url = f"{MAIL_TM_API_BASE_URL}/messages"; auth_headers = {**HTTP_HEADERS, 'Authorization': f'Bearer {token}'}
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.get(url, headers=auth_headers, timeout=REQUESTS_TIMEOUT)
+            if res.status_code == 401: return "AUTH_ERROR", "Invalid/expired mail.tm token."
+            res.raise_for_status(); data = res.json()
+            if isinstance(data.get('hydra:member'), list):
+                return "EMPTY" if not data['hydra:member'] else "SUCCESS", data['hydra:member']
+            return "API_ERROR", f"Unexp resp mail.tm msg list: {data}"
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} get mail.tm msgs: {e.response.text[:200]}"
+        except requests.exceptions.RequestException as e:
+            if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
+            else: return "NETWORK_ERROR", f"Net err get mail.tm msgs after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON mail.tm msgs."
+    return "API_ERROR", "Failed get mail.tm msgs after retries."
+
+def get_mail_tm_message_detail(token, message_api_id): 
+    url = f"{MAIL_TM_API_BASE_URL}{message_api_id}"; auth_headers = {**HTTP_HEADERS, 'Authorization': f'Bearer {token}'}
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.get(url, headers=auth_headers, timeout=REQUESTS_TIMEOUT)
+            if res.status_code == 401: return "AUTH_ERROR", "Invalid/expired mail.tm token (detail)."
+            res.raise_for_status(); data = res.json()
+            if isinstance(data, dict) and data.get('id'): return "SUCCESS", data
+            return "API_ERROR", f"Unexp resp mail.tm msg detail: {data}"
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in [500,502,503,504] and attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1)); continue
+            return "API_ERROR", f"HTTP {e.response.status_code} get mail.tm detail: {e.response.text[:200]}"
+        except requests.exceptions.RequestException as e:
+            if attempt<MAX_RETRIES-1: time.sleep(RETRY_DELAY*(attempt+1))
+            else: return "NETWORK_ERROR", f"Net err get mail.tm detail after {MAX_RETRIES} attempts."
+        except ValueError: return "JSON_ERROR", "Invalid JSON mail.tm detail."
+    return "API_ERROR", "Failed get mail.tm detail after retries."
 
 # --- Profile Generator ---
 def generate_username_profile(): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=10))
-def generate_password_profile(): return ''.join(random.choices(string.ascii_letters+string.digits,k=8)) + datetime.datetime.now().strftime("%d%m")
+def generate_password_profile(): return ''.join(random.choices(string.ascii_letters+string.digits,k=12)) 
 def generate_us_phone(): return f"1{random.randint(200,999)}{''.join([str(random.randint(0,9)) for _ in range(7)])}"
 def generate_profile(gender):
     name = fake.name_male() if gender=="male" else fake.name_female()
@@ -232,30 +275,24 @@ def is_valid_base32(s):
     except: return False
 
 # --- Email Formatting & Background Workers ---
-def format_temp_mail_org_message(msg_detail): 
-    sender = msg_detail.get('mail_from', 'N/A') # Key might be 'from' or 'mail_from'
-    subject = msg_detail.get('mail_subject', msg_detail.get('subject', '(No Subject)'))
-    body_content = msg_detail.get('mail_text', '') 
-    if not body_content: body_content = msg_detail.get('mail_html', '') # Fallback to HTML
-    if not body_content: body_content = msg_detail.get('html', '') # Another common HTML key
-    
-    if body_content and ("<" in body_content and ">" in body_content): # Basic check if it's HTML
-        body_content = re.sub(r'<style.*?</style>','',body_content,flags=re.DOTALL|re.IGNORECASE)
-        body_content = re.sub(r'<script.*?</script>','',body_content,flags=re.DOTALL|re.IGNORECASE)
-        body_content = re.sub(r'<br\s*/?>','\n',body_content,flags=re.IGNORECASE)
-        body_content = re.sub(r'</p>','\n</p>',body_content,flags=re.IGNORECASE) 
-        body_content = re.sub(r'<[^>]+>','',body_content)
-        body_content = body_content.replace('&nbsp;',' ').replace('&amp;','&').replace('&lt;','<').replace('&gt;','>')
-        body_content = '\n'.join([ln.strip() for ln in body_content.splitlines() if ln.strip()])
+def format_mail_tm_message(msg_detail):
+    sender_info = msg_detail.get('from', {}); sender = sender_info.get('address', 'N/A') if isinstance(sender_info, dict) else 'N/A'
+    subject = msg_detail.get('subject', '(No Subject)'); body_content = msg_detail.get('text', '')
+    if not body_content and msg_detail.get('html'):
+        html_body_list = msg_detail.get('html', [])
+        if html_body_list and isinstance(html_body_list, list):
+            html_body = html_body_list[0] 
+            body_content = re.sub(r'<style.*?</style>','',html_body,flags=re.DOTALL|re.IGNORECASE)
+            body_content = re.sub(r'<script.*?</script>','',body_content,flags=re.DOTALL|re.IGNORECASE)
+            body_content = re.sub(r'<br\s*/?>','\n',body_content,flags=re.IGNORECASE)
+            body_content = re.sub(r'</p>','\n</p>',body_content,flags=re.IGNORECASE) 
+            body_content = re.sub(r'<[^>]+>','',body_content)
+            body_content = body_content.replace('&nbsp;',' ').replace('&amp;','&').replace('&lt;','<').replace('&gt;','>')
+            body_content = '\n'.join([ln.strip() for ln in body_content.splitlines() if ln.strip()])
     body_content = body_content.strip() if body_content else "(No Content)"
-    
-    ts_str = msg_detail.get('mail_timestamp', msg_detail.get('date', ''))
-    recv_time = "Just now"
-    if ts_str:
-        try: recv_time = datetime.datetime.fromtimestamp(int(ts_str)).strftime('%Y-%m-%d %H:%M:%S UTC')
-        except: # If timestamp is already formatted date string
-            recv_time = str(ts_str)
-
+    recv_time_str = msg_detail.get('createdAt', 'Just now'); recv_time = recv_time_str
+    try: dt_obj = datetime.datetime.fromisoformat(recv_time_str.replace("Z","+00:00")); recv_time = dt_obj.strftime('%Y-%m-%d %H:%M:%S UTC')
+    except: pass
     return (f"━━━━━━━━━\n📬*New Email!*\n━━━━━━━━━\n👤*From:* `{sender}`\n📨*Subject:* _{subject}_\n🕒*Recv:* {recv_time}\n"
             f"━━━━━━━━━\n💬*Body:*\n{body_content[:3500]}\n━━━━━━━━━")
 
@@ -266,36 +303,32 @@ def auto_refresh_worker():
             for chat_id in list(user_data.keys()):
                 if is_bot_blocked(chat_id) or (chat_id not in approved_users and not is_admin(chat_id)):
                     safe_delete_user(chat_id); continue
-                
-                email_info = user_data.get(chat_id)
-                if not email_info or "email" not in email_info: continue
-                email_address = email_info["email"]
-                
-                list_status, messages = fetch_temp_mail_org_messages(email_address)
+                session_info = user_data.get(chat_id)
+                if not session_info or "token" not in session_info: continue
+                token = session_info["token"]
+                list_status, messages_summary = get_mail_tm_messages(token)
 
-                if list_status not in ["SUCCESS","EMPTY"]: 
-                    print(f"[{datetime.datetime.now()}] Auto-refresh: Err temp-mail.org list {chat_id}: {list_status}-{messages}"); continue
-                if list_status == "EMPTY" or not messages: continue
+                if list_status == "AUTH_ERROR":
+                    print(f"[{datetime.datetime.now()}] Auto-refresh: Auth err {chat_id}. Clearing."); user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
+                    safe_send_message(chat_id, "⚠️ mail.tm session expired. Use '📬 New mail'."); continue
+                if list_status not in ["SUCCESS","EMPTY"]: print(f"[{datetime.datetime.now()}] Auto-refresh: Err mail.tm list {chat_id}: {list_status}-{messages_summary}"); continue
+                if list_status == "EMPTY" or not messages_summary: continue
 
                 seen_ids = last_message_ids.setdefault(chat_id, set())
-                try: messages.sort(key=lambda m: int(m.get('mail_timestamp', 0)), reverse=True) # Sort by timestamp
-                except: pass 
-
-                for msg_detail in messages[:5]: 
-                    # Unique ID for temp-mail.org messages is often 'mail_id' or part of '_id'
-                    msg_id = msg_detail.get('mail_id', msg_detail.get('_id', str(msg_detail)))
-                    if isinstance(msg_id, dict): msg_id = msg_id.get('$id', str(msg_detail)) # Handle Mongo-like IDs if present
-
-                    if not msg_id or str(msg_id) in seen_ids: continue # Ensure ID is string for set
-                    
-                    # With temp-mail.org, the list often contains enough detail, no second fetch needed
-                    if safe_send_message(chat_id, format_temp_mail_org_message(msg_detail)): 
-                        seen_ids.add(str(msg_id))
-                    time.sleep(0.5)
-                
+                for msg_summary in messages_summary[:5]: 
+                    msg_api_id = msg_summary.get('id'); unique_id = msg_summary.get('@id', msg_api_id)
+                    if not msg_api_id or unique_id in seen_ids: continue
+                    detail_status, detail_data = get_mail_tm_message_detail(token, msg_api_id)
+                    if detail_status == "SUCCESS":
+                        if safe_send_message(chat_id, format_mail_tm_message(detail_data)): seen_ids.add(unique_id)
+                        time.sleep(0.7)
+                    elif detail_status == "AUTH_ERROR":
+                        print(f"[{datetime.datetime.now()}] Auto-refresh: Auth err detail {chat_id}. Clearing."); user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
+                        safe_send_message(chat_id, "⚠️ Mail.tm session invalid (detail). Use '📬 New mail'."); break 
+                    else: print(f"[{datetime.datetime.now()}] Auto-refresh: Err detail msg {msg_api_id} ({chat_id}): {detail_status}-{detail_data}")
                 if len(seen_ids)>150: oldest=random.sample(list(seen_ids), len(seen_ids)-75) if len(seen_ids)>75 else []; [seen_ids.discard(oid) for oid in oldest]
         except Exception as e: print(f"[{datetime.datetime.now()}] Error in auto_refresh_worker: {type(e).__name__} - {e}")
-        time.sleep(40) # Refresh interval
+        time.sleep(30)
 
 def cleanup_blocked_users():
     print(f"[{datetime.datetime.now()}] Cleanup_blocked_users worker started.")
@@ -307,6 +340,9 @@ def cleanup_blocked_users():
         time.sleep(3600) 
 
 # --- Bot Handlers ---
+# ... (Welcome, Admin, Profile, Account, 2FA handlers are the same as the previous correct version, 
+#      only Mail Handlers below are specifically for mail.tm) ...
+
 @bot.message_handler(commands=['start','help'])
 def send_welcome(m):
     cid=m.chat.id; 
@@ -418,7 +454,7 @@ def back_to_admin(m): safe_send_message(m.chat.id,"⬅️To admin",reply_markup=
 def admin_back_main(m): safe_send_message(m.chat.id,"⬅️To main",reply_markup=get_main_keyboard(m.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith(('approve_','reject_')))
-def handle_approval(c):
+def handle_approval(c): 
     if not is_admin(c.message.chat.id): bot.answer_callback_query(c.id,"❌Not allowed."); return
     try: act,uid_s=c.data.split('_'); uid=int(uid_s)
     except: bot.answer_callback_query(c.id,"Err."); bot.edit_message_text("Err.",c.message.chat.id,c.message.message_id); return
@@ -439,41 +475,60 @@ def handle_approval(c):
         bot.answer_callback_query(c.id,f"User {n} rejected.")
         bot.edit_message_text(f"❌User `{n}`({uid}) rejected.",c.message.chat.id,c.message.message_id,reply_markup=None)
 
-# --- Mail Handlers (temp-mail.org style) ---
+# --- Mail Handlers (mail.tm) ---
 @bot.message_handler(func=lambda msg: msg.text == "📬 New mail")
-def new_mail_temp_mail_org(message):
+def new_mail(message): 
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)): safe_send_message(chat_id, "⏳ Access pending."); return
     
     user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
-    gen_msg = safe_send_message(chat_id, "⏳ Generating new email (temp-mail.org style)...")
+    gen_msg = safe_send_message(chat_id, "⏳ Generating new email (mail.tm)...")
 
-    status, email_data = generate_temp_mail_org_address() # This returns {"email": ...}
+    domains = get_mail_tm_domains()
+    if not domains:
+        err_txt = "❌ Failed to get domains from mail.tm. Service might be unavailable. Try later."
+        if gen_msg: bot.edit_message_text(err_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
+        else: safe_send_message(chat_id, err_txt, parse_mode="Markdown")
+        return
+    
+    domain = random.choice(domains)
+    email_address = generate_mail_tm_email(domain) 
+    password = generate_password_profile() 
 
-    if status == "SUCCESS" and email_data and "email" in email_data :
-        user_data[chat_id] = email_data # Store {"email": "user@domain.com"}
+    status_create, acc_data = create_mail_tm_account(email_address, password)
+
+    if status_create not in ["CREATED", "EXISTS"]:
+        err_txt = f"❌ Failed to create mail.tm account for `{email_address}`: {acc_data}. Try again or check service."
+        if gen_msg: bot.edit_message_text(err_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
+        else: safe_send_message(chat_id, err_txt, parse_mode="Markdown")
+        return
+
+    status_token, token_data = get_mail_tm_token(email_address, password)
+    if status_token == "SUCCESS" and token_data:
+        user_data[chat_id] = {
+            "email": email_address, "password": password, "token": token_data["token"],
+            "id": token_data["id"], "account_id_short": token_data["id"].split('/')[-1] if token_data.get("id") else "N/A"
+        }
         last_message_ids[chat_id] = set() 
-        msg_txt = f"✅ *New Email (temp-mail.org style):*\n`{email_data['email']}`\n\nTap to copy. Use 'Refresh' button."
+        msg_txt = f"✅ *New Email (mail.tm):*\n`{email_address}`\n\nTap to copy. Use 'Refresh' button."
         if gen_msg: bot.edit_message_text(msg_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, msg_txt, parse_mode="Markdown")
     else:
-        error_txt = f"❌ Failed to generate email: {email_data}.\nThis often means a network problem from the bot's location trying to reach the email service. Please check your server's internet connection, firewall, DNS, or try again much later."
+        error_txt = f"❌ Failed to get token for mail.tm account `{email_address}`: {token_data}.\nThis can happen if the email service is busy or if there's a temporary issue. Please try '📬 New mail' again after a short while. If the problem persists, your network might be unable to reliably connect."
         if gen_msg: bot.edit_message_text(error_txt, chat_id, gen_msg.message_id, parse_mode="Markdown")
         else: safe_send_message(chat_id, error_txt, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda msg: msg.text == "🔄 Refresh") 
-def refresh_mail_temp_mail_org(message): 
+def refresh_mail(message): 
     chat_id = message.chat.id
     if is_bot_blocked(chat_id): safe_delete_user(chat_id); return
     if not (chat_id in approved_users or is_admin(chat_id)): safe_send_message(chat_id, "⏳ Access pending."); return
-    
-    email_info = user_data.get(chat_id)
-    if not email_info or "email" not in email_info: 
-        safe_send_message(chat_id, "⚠️ No active email. Use '📬 New mail'."); return
+    session_info = user_data.get(chat_id)
+    if not session_info or "token" not in session_info: safe_send_message(chat_id, "⚠️ No active mail.tm session. Use '📬 New mail'."); return
 
-    email_address = email_info["email"]
-    refresh_msg = safe_send_message(chat_id, f"🔄 Checking inbox for `{email_address}` (temp-mail.org style)...")
+    email_addr, token = session_info["email"], session_info["token"]
+    refresh_msg = safe_send_message(chat_id, f"🔄 Checking inbox for `{email_addr}` (mail.tm)...")
     
     def post_status_message(text_content):
         if refresh_msg:
@@ -481,13 +536,16 @@ def refresh_mail_temp_mail_org(message):
             except: safe_send_message(chat_id, text_content, parse_mode="Markdown")
         else: safe_send_message(chat_id, text_content, parse_mode="Markdown")
 
-    list_status, messages = fetch_temp_mail_org_messages(email_address)
-
-    if list_status == "EMPTY":
-        post_status_message(f"📭 Inbox for `{email_address}` is empty.")
+    list_status, messages_summary = get_mail_tm_messages(token)
+    if list_status == "AUTH_ERROR":
+        user_data.pop(chat_id, None); last_message_ids.pop(chat_id, None)
+        post_status_message(f"⚠️ Mail.tm token for `{email_addr}` expired/invalid. Use '📬 New mail'.")
+        return
+    elif list_status == "EMPTY":
+        post_status_message(f"📭 Inbox for `{email_addr}` is empty.")
         return
     elif list_status != "SUCCESS":
-        post_status_message(f"⚠️ Error fetching emails for `{email_address}`: {messages}\nTemp-mail.org style service might be unavailable. Try '📬 New mail' or later.")
+        post_status_message(f"⚠️ Error fetching emails for `{email_addr}`: {messages_summary}\nMail.tm service might be unavailable. Try later or '📬 New mail'.")
         return
     
     if refresh_msg: 
@@ -495,22 +553,20 @@ def refresh_mail_temp_mail_org(message):
         except: pass 
     
     seen_ids, new_count = last_message_ids.setdefault(chat_id, set()), 0
-    try: messages.sort(key=lambda m: int(m.get('mail_timestamp', 0)), reverse=True)
-    except: pass
-
-    for msg_detail in messages[:10]: 
-        msg_id_str = str(msg_detail.get('mail_id', msg_detail.get('_id', str(msg_detail))))
-        if isinstance(msg_detail.get('_id'), dict): msg_id_str = str(msg_detail['_id'].get('$id', str(msg_detail)))
-
-        if not msg_id_str or msg_id_str in seen_ids: continue
-        
-        new_count +=1
-        if safe_send_message(chat_id, format_temp_mail_org_message(msg_detail)): 
-            seen_ids.add(msg_id_str)
-        time.sleep(0.5)
-            
-    if new_count == 0: safe_send_message(chat_id, f"✅ No *new* messages in `{email_address}` since last check.")
-    else: safe_send_message(chat_id, f"✨ Found {new_count} new message(s) for `{email_address}`.")
+    for msg_summary in messages_summary[:10]: 
+        msg_api_id = msg_summary.get('id'); unique_identifier = msg_summary.get('@id', msg_api_id)
+        if not msg_api_id or unique_identifier in seen_ids: continue
+        detail_status, detail_data = get_mail_tm_message_detail(token, msg_api_id)
+        if detail_status == "SUCCESS":
+            new_count +=1
+            if safe_send_message(chat_id, format_mail_tm_message(detail_data)): seen_ids.add(unique_identifier)
+            time.sleep(0.5)
+        elif detail_status == "AUTH_ERROR":
+            user_data.pop(chat_id,None); last_message_ids.pop(chat_id,None)
+            safe_send_message(chat_id, "⚠️ Mail.tm token invalid fetching details. Use '📬 New mail'."); break
+        else: safe_send_message(chat_id, f"⚠️ Error fetching detail for msg ({msg_api_id}): {detail_data}")
+    if new_count == 0: safe_send_message(chat_id, f"✅ No *new* messages in `{email_addr}` since last check.")
+    else: safe_send_message(chat_id, f"✨ Found {new_count} new message(s) for `{email_addr}`.")
 
 # --- Profile & Account Handlers ---
 @bot.message_handler(func=lambda m:m.text in ["👨 Male Profile","👩 Female Profile"])
@@ -530,8 +586,8 @@ def show_my_email(m):
     cid=m.chat.id;
     if is_bot_blocked(cid): return
     if not (cid in approved_users or is_admin(cid)): safe_send_message(cid,"⏳Access pending."); return
-    email=user_data.get(cid,{}).get('email') 
-    if email: safe_send_message(cid,f"✉️Current Email:\n`{email}`\nTap to copy.")
+    email=user_data.get(cid,{}).get('email')
+    if email: safe_send_message(cid,f"✉️Current mail.tm Email:\n`{email}`\nTap to copy.")
     else: safe_send_message(cid,"ℹ️No active email. Use '📬 New mail'.",reply_markup=get_main_keyboard(cid))
 @bot.message_handler(func=lambda m:m.text=="🆔 My Info")
 def show_my_info(m):
