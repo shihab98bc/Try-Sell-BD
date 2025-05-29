@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import pyotp
 import binascii
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from bs4 import BeautifulSoup # Added for HTML parsing in emails
+from bs4 import BeautifulSoup # For HTML parsing in emails
 
 load_dotenv()
 fake = Faker()
@@ -353,8 +353,9 @@ def auto_refresh_worker():
                             print(f"Error fetching message detail {msg_id} for {chat_id}: {req_e}")
                         except Exception as detail_e:
                             print(f"Error processing message detail {msg_id} for {chat_id}: {detail_e}")
-                    if len(seen_ids) > 50:
-                        oldest_ids = sorted(list(seen_ids), key=lambda x: msg_summary.get('createdAt', ''))[:-30] # type: ignore
+                    if len(seen_ids) > 50: # type: ignore
+                        # Ensure msg_summary is available for key in sort or use a default
+                        oldest_ids = sorted(list(seen_ids), key=lambda id_val: messages[0].get('createdAt', '') if messages else '')[:-30]
                         for old_id in oldest_ids:
                             if old_id in seen_ids: seen_ids.remove(old_id)
                 except requests.RequestException as e:
@@ -481,7 +482,15 @@ def list_users(message):
 
     for user_id_val in approved_users:
         user_display_text = ""
-        if user_id_val == int(ADMIN_ID): # type: ignore
+        # Ensure ADMIN_ID is comparable as int if user_id_val is int
+        admin_id_int = 0
+        if ADMIN_ID:
+            try:
+                admin_id_int = int(ADMIN_ID)
+            except ValueError:
+                print(f"Warning: Could not convert ADMIN_ID '{ADMIN_ID}' to int for comparison.")
+        
+        if user_id_val == admin_id_int:
              user_display_text = f"👑 Admin (`{user_id_val}`)"
         else:
             user_display_text = f"🆔 `{user_id_val}`"
@@ -524,7 +533,13 @@ def process_user_removal(message):
         return
     try:
         user_id_to_remove_val = int(message.text.strip())
-        if user_id_to_remove_val == int(ADMIN_ID): # type: ignore
+        admin_id_int = 0
+        if ADMIN_ID:
+            try:
+                admin_id_int = int(ADMIN_ID)
+            except ValueError: pass # Handled by earlier print
+
+        if user_id_to_remove_val == admin_id_int:
             safe_send_message(chat_id_admin, "❌ Cannot remove the admin account!", reply_markup=get_user_management_keyboard())
             return
 
@@ -1094,7 +1109,7 @@ def handle_all_text_messages(message):
         "📜 List Users", "❌ Remove User", "📢 Text Broadcast", "📋 Media Broadcast",
         "📧 My Email", "🆔 My Info"
     ]
-    if text_val not in known_buttons:
+    if text_val not in known_buttons and not text_val.startswith('/'): # Avoid replying to commands handled by other handlers
         if chat_id_val in approved_users or is_admin(chat_id_val):
             safe_send_message(chat_id_val, f"🤔 I didn't understand '{text_val}'. Please use the buttons or commands.", reply_markup=get_main_keyboard(chat_id_val))
 
@@ -1155,7 +1170,7 @@ def cb_2fa_back_to_platform_selection(call):
 
 if __name__ == '__main__':
     print("🤖 Bot is preparing to launch...")
-    if not ADMIN_ID or ADMIN_ID == "YOUR_ADMIN_ID_HERE": # type: ignore
+    if not ADMIN_ID or ADMIN_ID == "YOUR_ADMIN_ID_HERE":
         print("🚨 CRITICAL: ADMIN_ID is not set in your .env file or is set to placeholder.")
         print("🚨 The bot may not function correctly, especially admin features and user approvals.")
 
@@ -1163,5 +1178,5 @@ if __name__ == '__main__':
     threading.Thread(target=cleanup_blocked_users, daemon=True, name="CleanupBlockedUsers").start()
 
     print(f"🎉 Bot is running with ADMIN_ID: {ADMIN_ID}")
-    print(f"PyTeleBot Version: {telebot.__version__}") # Corrected attribute
+    print(f"PyTeleBot Version: {telebot.__version__}")
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
